@@ -177,7 +177,7 @@ vi.mock("./useAgentConversationTitleEvents", () => ({
 
 const runtime: AgentRuntimeSelection = {
   provider: "codex",
-  modelId: "gpt-5.4",
+  modelId: "gpt-5.5",
 };
 
 const project = {
@@ -362,6 +362,11 @@ function renderAgentsView() {
   return renderWithProviders(
     <AgentsView projectId="project-1" onCreateProject={vi.fn()} />
   );
+}
+
+function openSelect(testId: string) {
+  const trigger = screen.getByTestId(testId);
+  fireEvent.keyDown(trigger, { key: "ArrowDown", code: "ArrowDown" });
 }
 
 function selectSidebarConversationRow() {
@@ -707,6 +712,26 @@ describe("AgentsView", () => {
     expect(screen.queryByTestId("integrated-chat-panel")).not.toBeInTheDocument();
   });
 
+  it("shows descriptive Codex model labels in the starter composer model select", async () => {
+    mockAgentViewData();
+
+    renderAgentsView();
+    await waitFor(() =>
+      expect(screen.getByTestId("agents-start-model")).toBeInTheDocument()
+    );
+
+    openSelect("agents-start-model");
+
+    expect(
+      screen.getByRole("option", {
+        name: /gpt-5\.5 - Frontier model for complex coding, research, and real-world work\./,
+      })
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("option", { name: /gpt-5\.4 - Strong model for everyday coding\./ })
+    ).toBeInTheDocument();
+  });
+
   it("starts a new conversation directly from the starter composer and triggers the session namer", async () => {
     const invalidateSpy = vi.spyOn(QueryClient.prototype, "invalidateQueries");
     mockAgentViewData();
@@ -724,7 +749,7 @@ describe("AgentsView", () => {
           projectId: "project-1",
           content: "fix agent landing flow",
           providerHarness: "codex",
-          modelId: "gpt-5.4",
+          modelId: "gpt-5.5",
           mode: "edit",
           base: expect.objectContaining({
             kind: "project_default",
@@ -933,7 +958,7 @@ describe("AgentsView", () => {
           content: "review this note",
           conversationId: "conversation-seeded",
           providerHarness: "codex",
-          modelId: "gpt-5.4",
+          modelId: "gpt-5.5",
           mode: "edit",
         })
       )
