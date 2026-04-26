@@ -10,6 +10,9 @@ use std::time::Duration;
 use lazy_static::lazy_static;
 use regex::Regex;
 
+use crate::application::publish_resilience::{
+    count_existing_publish_branch_reviewable_commits, push_publish_branch,
+};
 use crate::application::GitService;
 use crate::domain::entities::plan_branch::{PlanBranchId, PrPushStatus, PrStatus};
 use crate::domain::entities::InternalStatus;
@@ -120,7 +123,7 @@ pub(crate) async fn clean_stale_git_state(wt_path: &Path, task_id_str: &str) {
 pub(crate) async fn pre_delete_worktree(repo_path: &Path, worktree: &Path, task_id: &str) {
     // Skip silently if the path was never created — avoids spurious WARN-level
     // "git worktree remove: not a working tree" logs on paths that don't exist.
-    if !worktree.exists() {
+    if !crate::utils::path_safety::checked_exists(worktree, "stale worktree").unwrap_or(false) {
         return;
     }
 
@@ -158,7 +161,12 @@ pub(crate) async fn pre_delete_worktree(repo_path: &Path, worktree: &Path, task_
             // Covers file-lock scenarios where the first attempt races a process still
             // holding handles inside the worktree directory.
             tokio::time::sleep(Duration::from_millis(100)).await;
-            let second_chance_ok = match tokio::fs::remove_dir_all(worktree).await {
+            let second_chance_ok = match crate::utils::path_safety::checked_remove_dir_all(
+                worktree,
+                "stale worktree second-chance cleanup",
+            )
+            .await
+            {
                 Ok(()) => {
                     tracing::info!(
                         task_id = task_id,
@@ -175,7 +183,12 @@ pub(crate) async fn pre_delete_worktree(repo_path: &Path, worktree: &Path, task_
                         "Second-chance remove_dir_all also failed — worktree may block creation"
                     );
                     // Emit a directory listing to help diagnose which process holds the lock.
-                    if let Ok(mut entries) = tokio::fs::read_dir(worktree).await {
+                    if let Ok(mut entries) = crate::utils::path_safety::checked_read_dir(
+                        worktree,
+                        "locked worktree diagnostics",
+                    )
+                    .await
+                    {
                         let mut names = Vec::new();
                         while let Ok(Some(entry)) = entries.next_entry().await {
                             names.push(entry.file_name().to_string_lossy().into_owned());
@@ -193,7 +206,13 @@ pub(crate) async fn pre_delete_worktree(repo_path: &Path, worktree: &Path, task_
             // Run git worktree prune unconditionally — cleans stale internal git entries
             // even if the directory removal succeeded (git may still track the old path).
             super::cleanup_helpers::git_worktree_prune(repo_path).await;
-            if !second_chance_ok && worktree.exists() {
+            if !second_chance_ok
+                && crate::utils::path_safety::checked_exists(
+                    worktree,
+                    "stale worktree post-cleanup check",
+                )
+                .unwrap_or(false)
+            {
                 tracing::error!(
                     task_id = task_id,
                     worktree_path = %wt_display,
@@ -1184,7 +1203,7 @@ async fn push_pr_branch_to_remote(
         "sync_plan_branch_pr_if_needed: pushing updated plan branch to GitHub"
     );
 
-    match github.push_branch(repo_path, &pb.branch_name).await {
+    match push_publish_branch(github, repo_path, &pb.branch_name).await {
         Ok(()) => {
             if let Err(e) = plan_branch_repo
                 .update_pr_push_status(&pb.id, PrPushStatus::Pushed)
@@ -1416,15 +1435,7 @@ pub(crate) async fn plan_branch_reviewable_commit_count(
 ) -> AppResult<u32> {
     let repo_path = Path::new(&project.working_directory);
     let pr_base = resolve_plan_branch_pr_base(project, pb);
-
-    if !GitService::branch_exists(repo_path, &pb.branch_name)
-        .await
-        .unwrap_or(false)
-    {
-        return Ok(0);
-    }
-
-    GitService::count_commits_not_on_branch(repo_path, &pb.branch_name, &pr_base).await
+    count_existing_publish_branch_reviewable_commits(repo_path, &pb.branch_name, &pr_base).await
 }
 
 pub(crate) async fn plan_branch_has_reviewable_diff(
@@ -1512,7 +1523,7 @@ pub(crate) async fn create_draft_pr_if_needed(
         let needs_push = !matches!(current_pb.pr_push_status, PrPushStatus::Pushed);
         if needs_push {
             tracing::info!(branch = %branch_name, "create_draft_pr_if_needed: pushing branch");
-            match github.push_branch(repo_path, &branch_name).await {
+            match push_publish_branch(github, repo_path, &branch_name).await {
                 Ok(()) => {
                     if let Err(e) = plan_branch_repo
                         .update_pr_push_status(&plan_branch_id, PrPushStatus::Pushed)
@@ -1826,7 +1837,9 @@ pub(crate) async fn restore_task_worktree(
     let task_wt_str = compute_task_worktree_path(project, task_id_str);
     let task_wt_path = PathBuf::from(&task_wt_str);
 
-    if task_wt_path.exists() {
+    if crate::utils::path_safety::checked_exists(&task_wt_path, "task worktree restore")
+        .unwrap_or(false)
+    {
         tracing::info!(
             task_id = task_id_str,
             worktree_path = %task_wt_path.display(),

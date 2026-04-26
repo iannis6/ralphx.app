@@ -30,6 +30,10 @@ const {
   restoreConversationMock,
   getPlanBranchesMock,
   listIdeationSessionsMock,
+  getWorkspaceChangesMock,
+  getWorkspaceDiffMock,
+  toastErrorMock,
+  toastSuccessMock,
 } = vi.hoisted(() => ({
   useProjectsMock: vi.fn(),
   useProjectAgentConversationsMock: vi.fn(),
@@ -48,6 +52,10 @@ const {
   restoreConversationMock: vi.fn(),
   getPlanBranchesMock: vi.fn(),
   listIdeationSessionsMock: vi.fn(),
+  getWorkspaceChangesMock: vi.fn(),
+  getWorkspaceDiffMock: vi.fn(),
+  toastErrorMock: vi.fn(),
+  toastSuccessMock: vi.fn(),
 }));
 
 vi.mock("@/hooks/useProjects", () => ({
@@ -123,6 +131,22 @@ vi.mock("@/api/ideation", () => ({
   },
 }));
 
+vi.mock("@/api/diff", () => ({
+  diffApi: {
+    getAgentConversationWorkspaceFileChanges: (...args: unknown[]) =>
+      getWorkspaceChangesMock(...args),
+    getAgentConversationWorkspaceFileDiff: (...args: unknown[]) =>
+      getWorkspaceDiffMock(...args),
+  },
+}));
+
+vi.mock("sonner", () => ({
+  toast: {
+    error: (...args: unknown[]) => toastErrorMock(...args),
+    success: (...args: unknown[]) => toastSuccessMock(...args),
+  },
+}));
+
 vi.mock("@/api/plan-branch", () => ({
   planBranchApi: {
     getByProject: (...args: unknown[]) => getPlanBranchesMock(...args),
@@ -164,7 +188,25 @@ vi.mock("@/components/Chat/IntegratedChatPanel", () => ({
 }));
 
 vi.mock("./AgentsArtifactPane", () => ({
-  AgentsArtifactPane: () => <div data-testid="agents-artifact-pane" />,
+  AgentsArtifactPane: ({
+    conversation,
+    onPublishWorkspace,
+  }: {
+    conversation: AgentConversation | null;
+    onPublishWorkspace?: (conversationId: string) => Promise<void>;
+  }) => (
+    <div data-testid="agents-artifact-pane">
+      {conversation && onPublishWorkspace ? (
+        <button
+          type="button"
+          data-testid="agents-publish-confirm"
+          onClick={() => void onPublishWorkspace(conversation.id)}
+        >
+          Publish
+        </button>
+      ) : null}
+    </div>
+  ),
 }));
 
 vi.mock("./useProjectAgentBridgeEvents", () => ({
@@ -404,8 +446,8 @@ describe("AgentsChatHeader", () => {
   it("hides artifact shortcut buttons while the artifact pane is open", () => {
     renderWithProviders(
       <AgentsChatHeader
-        conversation={conversation()}
-        workspace={null}
+        conversation={conversation({ agentMode: "ideation" })}
+        workspace={conversationWorkspace({ mode: "ideation" })}
         artifactOpen
         activeArtifactTab="plan"
         onRenameConversation={vi.fn().mockResolvedValue(undefined)}
@@ -415,7 +457,7 @@ describe("AgentsChatHeader", () => {
     );
 
     expect(screen.queryByLabelText("Plan")).not.toBeInTheDocument();
-    expect(screen.getByLabelText("Close artifacts")).toBeInTheDocument();
+    expect(screen.getByLabelText("Close panel")).toBeInTheDocument();
   });
 
   it("does not render redundant runtime metadata in the title area", () => {
@@ -475,8 +517,9 @@ describe("AgentsChatHeader", () => {
     expect(screen.getByTestId("agents-workspace-status")).toHaveTextContent("active");
   });
 
-  it("publishes edit-mode workspaces from the header", () => {
+  it("shows a commit and publish shortcut for editable workspaces", () => {
     const publish = vi.fn().mockResolvedValue(undefined);
+    const openPublishPane = vi.fn();
     renderWithProviders(
       <AgentsChatHeader
         conversation={conversation({ id: "conversation-1" })}
@@ -504,6 +547,7 @@ describe("AgentsChatHeader", () => {
         activeArtifactTab="plan"
         onRenameConversation={vi.fn().mockResolvedValue(undefined)}
         onPublishWorkspace={publish}
+        onOpenPublishPane={openPublishPane}
         onToggleArtifacts={vi.fn()}
         onSelectArtifact={vi.fn()}
       />
@@ -511,7 +555,94 @@ describe("AgentsChatHeader", () => {
 
     fireEvent.click(screen.getByTestId("agents-publish-workspace"));
 
-    expect(publish).toHaveBeenCalledWith("conversation-1");
+    expect(openPublishPane).toHaveBeenCalledTimes(1);
+    expect(publish).not.toHaveBeenCalled();
+  });
+
+  it("uses the publish action as a pane shortcut instead of immediately publishing", () => {
+    const openPublishPane = vi.fn();
+    const publish = vi.fn().mockResolvedValue(undefined);
+    renderWithProviders(
+      <AgentsChatHeader
+        conversation={conversation({ id: "conversation-1" })}
+        workspace={conversationWorkspace()}
+        artifactOpen={false}
+        activeArtifactTab="plan"
+        onRenameConversation={vi.fn().mockResolvedValue(undefined)}
+        onPublishWorkspace={publish}
+        onOpenPublishPane={openPublishPane}
+        onToggleTerminal={vi.fn()}
+        onToggleArtifacts={vi.fn()}
+        onSelectArtifact={vi.fn()}
+      />
+    );
+
+    fireEvent.click(screen.getByTestId("agents-publish-workspace"));
+
+    expect(openPublishPane).toHaveBeenCalledTimes(1);
+    expect(publish).not.toHaveBeenCalled();
+  });
+
+  it("collapses the publish header label while the publish pane is open", () => {
+    renderWithProviders(
+      <AgentsChatHeader
+        conversation={conversation({ id: "conversation-1", agentMode: "edit" })}
+        workspace={conversationWorkspace({ mode: "edit" })}
+        artifactOpen
+        activeArtifactTab="publish"
+        onRenameConversation={vi.fn().mockResolvedValue(undefined)}
+        onPublishWorkspace={vi.fn().mockResolvedValue(undefined)}
+        onOpenPublishPane={vi.fn()}
+        onToggleTerminal={vi.fn()}
+        onToggleArtifacts={vi.fn()}
+        onSelectArtifact={vi.fn()}
+      />
+    );
+
+    const publishButton = screen.getByTestId("agents-publish-workspace");
+    expect(publishButton).toBeInTheDocument();
+    expect(publishButton).not.toHaveTextContent("Commit & Publish");
+    expect(screen.queryByTestId("agents-workspace-status")).not.toBeInTheDocument();
+  });
+
+  it("hides ideation artifact shortcuts for edit-mode conversations", () => {
+    renderWithProviders(
+      <AgentsChatHeader
+        conversation={conversation({ agentMode: "edit" })}
+        workspace={conversationWorkspace({ mode: "edit" })}
+        artifactOpen={false}
+        activeArtifactTab="plan"
+        onRenameConversation={vi.fn().mockResolvedValue(undefined)}
+        onToggleTerminal={vi.fn()}
+        onToggleArtifacts={vi.fn()}
+        onSelectArtifact={vi.fn()}
+      />
+    );
+
+    expect(screen.queryByLabelText("Plan")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Verification")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Proposals")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Tasks")).not.toBeInTheDocument();
+  });
+
+  it("shows ideation artifact shortcuts for ideation-mode conversations", () => {
+    renderWithProviders(
+      <AgentsChatHeader
+        conversation={conversation({ agentMode: "ideation" })}
+        workspace={conversationWorkspace({ mode: "ideation" })}
+        artifactOpen={false}
+        activeArtifactTab="plan"
+        onRenameConversation={vi.fn().mockResolvedValue(undefined)}
+        onToggleTerminal={vi.fn()}
+        onToggleArtifacts={vi.fn()}
+        onSelectArtifact={vi.fn()}
+      />
+    );
+
+    expect(screen.getByLabelText("Plan")).toBeInTheDocument();
+    expect(screen.getByLabelText("Verification")).toBeInTheDocument();
+    expect(screen.getByLabelText("Proposals")).toBeInTheDocument();
+    expect(screen.getByLabelText("Tasks")).toBeInTheDocument();
   });
 
   it("toggles the terminal from the header when a workspace is available", () => {
@@ -577,6 +708,10 @@ describe("AgentsView", () => {
     restoreConversationMock.mockReset();
     getPlanBranchesMock.mockReset();
     listIdeationSessionsMock.mockReset();
+    getWorkspaceChangesMock.mockReset();
+    getWorkspaceDiffMock.mockReset();
+    toastErrorMock.mockReset();
+    toastSuccessMock.mockReset();
 
     sendAgentMessageMock.mockResolvedValue({
       conversationId: "conversation-2",
@@ -591,6 +726,8 @@ describe("AgentsView", () => {
     listConversationsMock.mockResolvedValue([]);
     getPlanBranchesMock.mockResolvedValue([]);
     listIdeationSessionsMock.mockResolvedValue([]);
+    getWorkspaceChangesMock.mockResolvedValue([]);
+    getWorkspaceDiffMock.mockResolvedValue("");
     publishAgentConversationWorkspaceMock.mockResolvedValue({
       workspace: {
         conversationId: "conversation-2",
@@ -705,9 +842,11 @@ describe("AgentsView", () => {
     expect(screen.getByTestId("agents-start-heading-word")).toHaveTextContent("agent");
     expect(screen.getByTestId("agents-start-project")).toBeInTheDocument();
     expect(screen.getByTestId("agents-start-base")).toBeInTheDocument();
-    expect(screen.getByTestId("agents-start-mode")).toBeInTheDocument();
     expect(screen.getByTestId("agents-start-provider")).toBeInTheDocument();
     expect(screen.getByTestId("agents-start-model")).toBeInTheDocument();
+    expect(screen.queryByTestId("agents-start-new-project")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByTestId("agent-composer-actions-menu"));
+    expect(screen.getByTestId("agents-start-mode-edit")).toBeInTheDocument();
     expect(screen.getByTestId("agents-start-new-project")).toBeInTheDocument();
     expect(screen.queryByTestId("integrated-chat-panel")).not.toBeInTheDocument();
   });
@@ -828,8 +967,8 @@ describe("AgentsView", () => {
 
     renderAgentsView();
 
-    fireEvent.click(screen.getByTestId("agents-start-mode"));
-    fireEvent.click(screen.getByText("Chat"));
+    await userEvent.click(screen.getByTestId("agent-composer-actions-menu"));
+    await userEvent.click(screen.getByTestId("agents-start-mode-chat"));
     expect(screen.getByTestId("agents-start-base")).toBeInTheDocument();
 
     fireEvent.change(screen.getByTestId("agents-start-textarea"), {
@@ -976,6 +1115,7 @@ describe("AgentsView", () => {
     );
     mockSessionWithData({ planArtifactId: "plan-1" });
     resetAgentSessionState({
+      selectedConversationId: "conversation-1",
       artifactByConversationId: {
         "conversation-1": {
           isOpen: true,
@@ -1103,6 +1243,77 @@ describe("AgentsView", () => {
     expect(within(baseLine).getByRole("button", { name: "Start from" })).toBeDisabled();
   });
 
+  it("opens the right-side publish pane from the Commit & Publish header shortcut", async () => {
+    mockAgentViewData(conversation({ agentMode: "edit" }));
+    getAgentConversationWorkspaceMock.mockResolvedValue(conversationWorkspace({ mode: "edit" }));
+
+    renderAgentsView();
+    selectSidebarConversationRow();
+
+    await screen.findByTestId("agents-publish-workspace");
+    expect(screen.queryByTestId("agents-artifact-pane")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("agents-publish-workspace"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("agents-artifact-pane")).toBeInTheDocument()
+    );
+    expect(publishAgentConversationWorkspaceMock).not.toHaveBeenCalled();
+  });
+
+  it("relies on the backend to route fixable publish failures into the workspace agent conversation", async () => {
+    mockAgentViewData(conversation({ agentMode: "edit" }));
+    getAgentConversationWorkspaceMock
+      .mockResolvedValueOnce(conversationWorkspace({ mode: "edit" }))
+      .mockResolvedValueOnce(
+        conversationWorkspace({ mode: "edit", publicationPushStatus: "needs_agent" })
+      );
+    publishAgentConversationWorkspaceMock.mockRejectedValue(
+      "Failed to commit: typecheck failed"
+    );
+    renderAgentsView();
+    selectSidebarConversationRow();
+
+    await screen.findByTestId("agents-publish-workspace");
+    fireEvent.click(screen.getByTestId("agents-publish-workspace"));
+
+    await screen.findByTestId("agents-publish-confirm");
+    fireEvent.click(screen.getByTestId("agents-publish-confirm"));
+
+    await waitFor(() => expect(getAgentConversationWorkspaceMock).toHaveBeenCalledTimes(2));
+    expect(sendAgentMessageMock).not.toHaveBeenCalled();
+    expect(toastErrorMock).toHaveBeenCalledWith(
+      "Publish failed. Sent the error to the agent to fix."
+    );
+  });
+
+  it("does not send operational publish failures to the workspace agent", async () => {
+    mockAgentViewData(conversation({ agentMode: "edit" }));
+    getAgentConversationWorkspaceMock
+      .mockResolvedValueOnce(conversationWorkspace({ mode: "edit" }))
+      .mockResolvedValueOnce(
+        conversationWorkspace({ mode: "edit", publicationPushStatus: "failed" })
+      );
+    publishAgentConversationWorkspaceMock.mockRejectedValue(
+      "GitHub integration is not available"
+    );
+    renderAgentsView();
+    selectSidebarConversationRow();
+
+    await screen.findByTestId("agents-publish-workspace");
+    fireEvent.click(screen.getByTestId("agents-publish-workspace"));
+
+    await screen.findByTestId("agents-publish-confirm");
+    fireEvent.click(screen.getByTestId("agents-publish-confirm"));
+
+    await waitFor(() =>
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "GitHub integration is not available"
+      )
+    );
+    expect(sendAgentMessageMock).not.toHaveBeenCalled();
+  });
+
   it("keeps the artifact pane closed by default when the conversation has nothing to show", async () => {
     mockAgentViewData(
       conversation({
@@ -1127,7 +1338,15 @@ describe("AgentsView", () => {
   });
 
   it("does not auto-restore a persisted artifact pane when the conversation still has nothing to show", async () => {
-    mockAgentViewData();
+    mockAgentViewData(
+      conversation({
+        contextType: "ideation",
+        contextId: "session-1",
+        ideationSessionId: "session-1",
+        agentMode: "ideation",
+      })
+    );
+    mockSessionWithData();
     resetAgentSessionState({
       artifactByConversationId: {
         "conversation-1": {
@@ -1149,7 +1368,15 @@ describe("AgentsView", () => {
   });
 
   it("still allows manually opening the artifact pane when the conversation has nothing to show", async () => {
-    mockAgentViewData();
+    mockAgentViewData(
+      conversation({
+        contextType: "ideation",
+        contextId: "session-1",
+        ideationSessionId: "session-1",
+        agentMode: "ideation",
+      })
+    );
+    mockSessionWithData();
 
     renderAgentsView();
     selectSidebarConversationRow();

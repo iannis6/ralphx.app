@@ -12,7 +12,6 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   CheckCircle2,
   ClipboardList,
-  BrainCircuit,
   FileText,
   GitBranch,
   GitPullRequestArrow,
@@ -39,13 +38,6 @@ import { Input } from "@/components/ui/input";
 import { ResizeHandle } from "@/components/ui/ResizeHandle";
 import { BranchBasePicker } from "@/components/shared/BranchBasePicker";
 import type { BranchBaseOption } from "@/components/shared/branchBaseOptions";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import {
   Tooltip,
   TooltipContent,
@@ -84,7 +76,7 @@ import {
   AGENT_PROVIDER_OPTIONS,
   normalizeRuntimeSelection,
 } from "./agentOptions";
-import { AgentComposerSurface } from "./AgentComposerSurface";
+import { AgentComposerProjectLine, AgentComposerSurface } from "./AgentComposerSurface";
 import { AgentTerminalDrawer } from "./AgentTerminalDrawer";
 import { AgentsStartComposer } from "./AgentsStartComposer";
 import {
@@ -120,11 +112,22 @@ const AGENTS_SIDEBAR_COLLAPSE_STORAGE_KEY = "ralphx-agents-sidebar-collapsed";
 const AGENT_CONVERSATION_MODE_OPTIONS: Array<{
   id: AgentConversationWorkspaceMode;
   label: string;
+  description: string;
 }> = [
-  { id: "chat", label: "Chat" },
-  { id: "edit", label: "Edit Agent" },
-  { id: "ideation", label: "Ideation Mode" },
+  { id: "chat", label: "Chat", description: "Ask read-only questions about the project." },
+  { id: "edit", label: "Agent", description: "Build, change, and review code in a branch." },
+  { id: "ideation", label: "Ideation", description: "Plan work before creating tasks." },
 ];
+
+function getErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  if (typeof error === "string" && error.trim()) {
+    return error;
+  }
+  return fallback;
+}
 
 interface AgentsViewProps {
   projectId: string;
@@ -796,6 +799,13 @@ export function AgentsView({
     ]
   );
 
+  const handleOpenPublishPane = useCallback(() => {
+    if (!selectedConversationId) {
+      return;
+    }
+    openArtifactTab(selectedConversationId, "publish");
+  }, [openArtifactTab, selectedConversationId]);
+
   useEffect(() => {
     if (
       activeConversation?.contextType !== "project" ||
@@ -934,6 +944,10 @@ export function AgentsView({
   const handlePublishWorkspace = useCallback(
     async (conversationId: string) => {
       const conversation = findConversationById(conversationId);
+      const workspace =
+        selectedConversationId === conversationId
+          ? activeWorkspace
+          : optimisticWorkspacesByConversationId[conversationId] ?? null;
       setPublishingConversationId(conversationId);
       try {
         const result = await chatApi.publishAgentConversationWorkspace(conversationId);
@@ -943,17 +957,54 @@ export function AgentsView({
           queryClient.invalidateQueries({
             queryKey: ["agents", "conversation-workspace", conversationId],
           }),
+          queryClient.invalidateQueries({
+            queryKey: ["agents", "conversation-workspace-publication-events", conversationId],
+          }),
           conversation?.projectId
             ? invalidateProjectConversations(conversation.projectId)
             : Promise.resolve(),
         ]);
       } catch (err) {
-        toast.error(err instanceof Error ? err.message : "Failed to publish branch");
+        const errorMessage = getErrorMessage(err, "Failed to publish branch");
+        let refreshedWorkspace: AgentConversationWorkspace | null = null;
+        try {
+          refreshedWorkspace = await chatApi.getAgentConversationWorkspace(conversationId);
+          void queryClient.invalidateQueries({
+            queryKey: ["agents", "conversation-workspace-publication-events", conversationId],
+          });
+          if (refreshedWorkspace) {
+            queryClient.setQueryData(
+              ["agents", "conversation-workspace", conversationId],
+              refreshedWorkspace
+            );
+          }
+        } catch {
+          refreshedWorkspace = null;
+        }
+        const publishFailureNeedsAgent =
+          (refreshedWorkspace ?? workspace)?.publicationPushStatus === "needs_agent";
+
+        if (publishFailureNeedsAgent) {
+          toast.error("Publish failed. Sent the error to the agent to fix.");
+          if (conversation?.projectId) {
+            await invalidateProjectConversations(conversation.projectId);
+          }
+          invalidateConversationDataQueries(queryClient, conversationId);
+        } else {
+          toast.error(errorMessage);
+        }
       } finally {
         setPublishingConversationId(null);
       }
     },
-    [findConversationById, invalidateProjectConversations, queryClient]
+    [
+      activeWorkspace,
+      findConversationById,
+      invalidateProjectConversations,
+      optimisticWorkspacesByConversationId,
+      queryClient,
+      selectedConversationId,
+    ]
   );
 
   const defaultRuntime =
@@ -969,6 +1020,7 @@ export function AgentsView({
             .map((project) => ({
               id: project.id,
               label: project.name,
+              description: project.workingDirectory,
             }))
         : [],
     [activeProjectId, projects]
@@ -1205,19 +1257,20 @@ export function AgentsView({
                           ? { questionMode: composerProps.questionMode }
                           : {})}
                         submitLabel="Send"
-                        workspaceControls={
-                          activeConversationMode ? (
-                            <AgentConversationModeSelect
-                              value={activeConversationMode}
-                              onValueChange={handleActiveConversationModeChange}
-                              disabled={
-                                activeConversationModeLocked ||
-                                composerProps.agentStatus !== "idle" ||
-                                switchingConversationModeId === selectedConversationId
-                              }
-                            />
-                          ) : undefined
-                        }
+                        {...(activeConversationMode
+                          ? {
+                              mode: {
+                                value: activeConversationMode,
+                                onValueChange: (value: string) =>
+                                  handleActiveConversationModeChange(value as AgentConversationWorkspaceMode),
+                                options: AGENT_CONVERSATION_MODE_OPTIONS,
+                                disabled:
+                                  activeConversationModeLocked ||
+                                  composerProps.agentStatus !== "idle" ||
+                                  switchingConversationModeId === selectedConversationId,
+                              },
+                            }
+                          : {})}
                         project={{
                           value: activeProjectId,
                           onValueChange: () => undefined,
@@ -1237,9 +1290,18 @@ export function AgentsView({
                           options: AGENT_MODEL_OPTIONS[normalizedActiveRuntime.provider],
                         }}
                       />
-                      <AgentConversationBaseLine
-                        workspace={activeWorkspace}
-                      />
+                      <div className="mt-2 flex w-full flex-wrap items-center justify-between gap-2 px-2">
+                        <AgentComposerProjectLine
+                          value={activeProjectId}
+                          onValueChange={() => undefined}
+                          options={activeProjectOptions}
+                          placeholder="Current project"
+                          disabled
+                        />
+                        <AgentConversationBaseLine
+                          workspace={activeWorkspace}
+                        />
+                      </div>
                     </>
                   )}
                   {...(activeConversation.contextType === "project" && attachedIdeationSessionId
@@ -1255,6 +1317,7 @@ export function AgentsView({
                       terminalUnavailableReason={terminalUnavailableReason}
                       onRenameConversation={handleRenameConversation}
                       onPublishWorkspace={handlePublishWorkspace}
+                      onOpenPublishPane={handleOpenPublishPane}
                       isPublishingWorkspace={publishingConversationId === selectedConversationId}
                       onToggleTerminal={() => toggleTerminalOpen(selectedConversationId)}
                       onToggleArtifacts={() =>
@@ -1328,10 +1391,13 @@ export function AgentsView({
               >
                 <AgentsArtifactPane
                   conversation={activeConversation}
+                  workspace={activeWorkspace}
                   activeTab={artifactState.activeTab}
                   taskMode={artifactState.taskMode}
                   onTabChange={handleSelectArtifact}
                   onTaskModeChange={(mode) => setTaskArtifactMode(selectedConversationId, mode)}
+                  onPublishWorkspace={handlePublishWorkspace}
+                  isPublishingWorkspace={publishingConversationId === selectedConversationId}
                   onClose={() => setArtifactPaneVisibility(selectedConversationId, false)}
                 />
               </div>
@@ -1353,6 +1419,7 @@ interface AgentsChatHeaderProps {
   terminalUnavailableReason?: string | null;
   onRenameConversation: (conversationId: string, title: string) => Promise<void>;
   onPublishWorkspace?: (conversationId: string) => Promise<void>;
+  onOpenPublishPane?: () => void;
   isPublishingWorkspace?: boolean;
   onToggleTerminal?: () => void;
   onToggleArtifacts: () => void;
@@ -1368,12 +1435,16 @@ export function AgentsChatHeader({
   terminalUnavailableReason = null,
   onRenameConversation,
   onPublishWorkspace,
+  onOpenPublishPane,
   isPublishingWorkspace = false,
   onToggleTerminal,
   onToggleArtifacts,
   onSelectArtifact,
 }: AgentsChatHeaderProps) {
   const title = conversation?.title || "Untitled agent";
+  const conversationMode = conversation ? resolveConversationAgentMode(conversation, workspace) : null;
+  const showIdeationArtifacts = conversationMode === "ideation";
+  const publishPaneOpen = artifactOpen && activeArtifactTab === "publish";
   const [isEditing, setIsEditing] = useState(false);
   const [draftTitle, setDraftTitle] = useState(title);
 
@@ -1436,7 +1507,7 @@ export function AgentsChatHeader({
             </button>
           )}
         </div>
-        {workspace && <AgentsWorkspaceStatusPill workspace={workspace} />}
+        {workspace && !publishPaneOpen && <AgentsWorkspaceStatusPill workspace={workspace} />}
       </div>
 
       <div className="hidden md:flex items-center gap-1 ml-auto shrink-0">
@@ -1468,9 +1539,14 @@ export function AgentsChatHeader({
                 type="button"
                 variant="ghost"
                 size="sm"
-                className="h-8 gap-1.5 px-2.5 text-xs"
-                onClick={() => onPublishWorkspace?.(conversation.id)}
-                disabled={!onPublishWorkspace || isPublishingWorkspace || workspace.status === "missing"}
+                className={cn("h-8 text-xs", publishPaneOpen ? "w-8 p-0" : "gap-1.5 px-2.5")}
+                onClick={onOpenPublishPane}
+                disabled={
+                  !onPublishWorkspace ||
+                  !onOpenPublishPane ||
+                  isPublishingWorkspace ||
+                  workspace.status === "missing"
+                }
                 aria-label="Commit and publish branch"
                 data-testid="agents-publish-workspace"
               >
@@ -1479,7 +1555,7 @@ export function AgentsChatHeader({
                 ) : (
                   <GitPullRequestArrow className="h-3.5 w-3.5" />
                 )}
-                <span>Commit & Publish</span>
+                {!publishPaneOpen && <span>Commit & Publish</span>}
               </Button>
             </TooltipTrigger>
             <TooltipContent side="bottom" className="text-xs">
@@ -1488,7 +1564,7 @@ export function AgentsChatHeader({
           </Tooltip>
         )}
 
-        {!artifactOpen &&
+        {showIdeationArtifacts && !artifactOpen &&
           HEADER_ARTIFACT_TABS.map(({ id, label, icon: Icon }) => {
             const isActive = activeArtifactTab === id && artifactOpen;
             return (
@@ -1520,92 +1596,29 @@ export function AgentsChatHeader({
             );
           })}
 
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="h-8 w-8 p-0"
-              onClick={onToggleArtifacts}
-              aria-label={artifactOpen ? "Close artifacts" : "Open artifacts"}
-            >
-              {artifactOpen ? (
-                <PanelRightClose className="w-4 h-4" />
-              ) : (
-                <PanelRightOpen className="w-4 h-4" />
-              )}
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom" className="text-xs">
-            {artifactOpen ? "Close artifacts" : "Open artifacts"}
-          </TooltipContent>
-        </Tooltip>
-      </div>
-    </div>
-  );
-}
-
-function AgentConversationModeSelect({
-  value,
-  onValueChange,
-  disabled,
-}: {
-  value: AgentConversationWorkspaceMode;
-  onValueChange: (value: AgentConversationWorkspaceMode) => void;
-  disabled: boolean;
-}) {
-  return (
-    <div
-      className="inline-flex min-h-10 max-w-[178px] flex-none items-center gap-2 rounded-[12px] border px-2.5 py-1.5"
-      style={{
-        background: "color-mix(in srgb, var(--bg-base) 24%, var(--bg-surface) 76%)",
-        borderColor: "var(--overlay-weak)",
-      }}
-    >
-      <div
-        className="flex h-[24px] w-[24px] shrink-0 items-center justify-center rounded-full"
-        style={{ color: "var(--text-secondary)" }}
-      >
-        <BrainCircuit className="h-[13px] w-[13px]" />
-      </div>
-      <div className="min-w-0">
-        <div
-          className="mb-0.5 text-[8px] font-medium uppercase tracking-[0.16em]"
-          style={{ color: "var(--text-muted)" }}
-        >
-          Mode
-        </div>
-        <Select
-          value={value}
-          onValueChange={(nextValue) =>
-            onValueChange(nextValue as AgentConversationWorkspaceMode)
-          }
-          disabled={disabled}
-        >
-          <SelectTrigger
-            className="h-auto w-auto min-w-0 border-0 bg-transparent px-0 py-0 text-[12px] font-medium shadow-none outline-none ring-0 focus:outline-none focus:ring-0 focus-visible:outline-none focus-visible:ring-0 [&>span]:max-w-full"
-            style={{
-              color: "var(--text-primary)",
-              boxShadow: "none",
-              outline: "none",
-              WebkitAppearance: "none",
-              appearance: "none",
-            }}
-            data-testid="agents-conversation-mode"
-            data-theme-button-skip="true"
-            aria-label="Agent mode"
-          >
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {AGENT_CONVERSATION_MODE_OPTIONS.map((option) => (
-              <SelectItem key={option.id} value={option.id}>
-                {option.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+        {showIdeationArtifacts || artifactOpen ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-8 w-8 p-0"
+                onClick={onToggleArtifacts}
+                aria-label={artifactOpen ? "Close panel" : "Open artifacts"}
+              >
+                {artifactOpen ? (
+                  <PanelRightClose className="w-4 h-4" />
+                ) : (
+                  <PanelRightOpen className="w-4 h-4" />
+                )}
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" className="text-xs">
+              {artifactOpen ? "Close panel" : "Open artifacts"}
+            </TooltipContent>
+          </Tooltip>
+        ) : null}
       </div>
     </div>
   );
@@ -1691,7 +1704,7 @@ function AgentConversationBaseLine({
 
   return (
     <div
-      className="mt-2 flex w-full justify-end px-2"
+      className="flex min-w-0 justify-end"
       data-testid="agents-conversation-base"
     >
       <BranchBasePicker
