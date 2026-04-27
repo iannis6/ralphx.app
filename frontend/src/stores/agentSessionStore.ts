@@ -12,7 +12,7 @@ export interface AgentRuntimeSelection {
   modelId: string;
 }
 
-interface AgentArtifactState {
+export interface AgentArtifactState {
   isOpen: boolean;
   activeTab: AgentArtifactTab;
   taskMode: AgentTaskArtifactMode;
@@ -22,6 +22,7 @@ interface AgentSessionState {
   focusedProjectId: string | null;
   selectedProjectId: string | null;
   selectedConversationId: string | null;
+  lastSelectedConversationByProjectId: Record<string, string>;
   expandedProjectIds: Record<string, boolean>;
   showAllProjects: boolean;
   projectSort: AgentProjectSort;
@@ -40,6 +41,7 @@ interface AgentSessionActions {
   setProjectSort: (projectSort: AgentProjectSort) => void;
   setArtifactOpen: (conversationId: string, isOpen: boolean) => void;
   setArtifactTab: (conversationId: string, tab: AgentArtifactTab) => void;
+  setArtifactState: (conversationId: string, artifactState: AgentArtifactState) => void;
   setTaskArtifactMode: (conversationId: string, mode: AgentTaskArtifactMode) => void;
   setRuntimeForConversation: (
     conversationId: string,
@@ -67,6 +69,7 @@ export const useAgentSessionStore = create<AgentSessionState & AgentSessionActio
       focusedProjectId: null,
       selectedProjectId: null,
       selectedConversationId: null,
+      lastSelectedConversationByProjectId: {},
       expandedProjectIds: {},
       showAllProjects: false,
       projectSort: "latest",
@@ -77,6 +80,13 @@ export const useAgentSessionStore = create<AgentSessionState & AgentSessionActio
       setFocusedProject: (projectId) =>
         set((state) => {
           state.focusedProjectId = projectId;
+          const lastConversationId = projectId
+            ? (state.lastSelectedConversationByProjectId ?? {})[projectId]
+            : null;
+          if (projectId && lastConversationId) {
+            state.selectedProjectId = projectId;
+            state.selectedConversationId = lastConversationId;
+          }
           if (projectId) {
             state.expandedProjectIds[projectId] = true;
           }
@@ -87,6 +97,8 @@ export const useAgentSessionStore = create<AgentSessionState & AgentSessionActio
           state.focusedProjectId = projectId;
           state.selectedProjectId = projectId;
           state.selectedConversationId = conversationId;
+          state.lastSelectedConversationByProjectId ??= {};
+          state.lastSelectedConversationByProjectId[projectId] = conversationId;
           state.expandedProjectIds[projectId] = true;
         }),
 
@@ -128,6 +140,11 @@ export const useAgentSessionStore = create<AgentSessionState & AgentSessionActio
           artifactState.isOpen = true;
         }),
 
+      setArtifactState: (conversationId, artifactState) =>
+        set((state) => {
+          state.artifactByConversationId[conversationId] = { ...artifactState };
+        }),
+
       setTaskArtifactMode: (conversationId, mode) =>
         set((state) => {
           ensureArtifactState(state, conversationId).taskMode = mode;
@@ -145,6 +162,7 @@ export const useAgentSessionStore = create<AgentSessionState & AgentSessionActio
         focusedProjectId: state.focusedProjectId,
         selectedProjectId: state.selectedProjectId,
         selectedConversationId: state.selectedConversationId,
+        lastSelectedConversationByProjectId: state.lastSelectedConversationByProjectId,
         expandedProjectIds: state.expandedProjectIds,
         showAllProjects: state.showAllProjects,
         projectSort: state.projectSort,

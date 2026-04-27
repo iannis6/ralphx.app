@@ -1,33 +1,24 @@
 import {
   CheckCircle2,
-  Code,
   FileText,
   GitPullRequestArrow,
-  GitBranch,
   LayoutGrid,
   Network,
   ClipboardList,
-  Loader2,
   X,
 } from "lucide-react";
 import type { ElementType } from "react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { lazy, memo, Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
 import { artifactApi } from "@/api/artifact";
-import { diffApi } from "@/api/diff";
 import { ideationApi, toTaskProposal } from "@/api/ideation";
 import {
   chatApi,
   type AgentConversationWorkspace,
-  type AgentConversationWorkspacePublicationEvent,
 } from "@/api/chat";
-import { DiffViewer, type FileChange as DiffViewerFileChange } from "@/components/diff";
-import { TaskGraphView } from "@/components/TaskGraph";
-import { TaskBoard } from "@/components/tasks/TaskBoard";
 import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent } from "@/components/ui/dialog";
 import {
   Tooltip,
   TooltipContent,
@@ -35,18 +26,12 @@ import {
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { withAlpha } from "@/lib/theme-colors";
-import { ExportPlanDialog } from "@/components/Ideation/ExportPlanDialog";
-import { PlanDisplay } from "@/components/Ideation/PlanDisplay";
 import type { TeamMetadata } from "@/components/Ideation/PlanDisplay";
-import { PlanEditor } from "@/components/Ideation/PlanEditor";
-import { PlanEmptyState } from "@/components/Ideation/PlanEmptyState";
-import { ProposalsTabContent } from "@/components/Ideation/ProposalsTabContent";
-import { VerificationPanel } from "@/components/Ideation/VerificationPanel";
 import type {
   AgentArtifactTab,
   AgentTaskArtifactMode,
 } from "@/stores/agentSessionStore";
-import { useConversation } from "@/hooks/useChat";
+import { useConversationHistoryWindow } from "@/hooks/useChat";
 import { ideationKeys } from "@/hooks/useIdeation";
 import { useDependencyGraph } from "@/hooks/useDependencyGraph";
 import { useVerificationStatus } from "@/hooks/useVerificationStatus";
@@ -55,10 +40,45 @@ import type { IdeationSession, TaskProposal } from "@/types/ideation";
 import type { DependencyGraphResponse } from "@/api/ideation.types";
 import type { AgentConversation } from "./agentConversations";
 import { resolveAttachedIdeationSessionId } from "./attachedIdeationSession";
+import { EmptyArtifactState } from "./AgentsArtifactEmptyState";
+import { AgentPublishPanel } from "./AgentsPublishPanel";
 
 const EMPTY_PROPOSAL_HIGHLIGHTS = new Set<string>();
 
 function noop() {}
+
+const LazyTaskGraphView = lazy(() =>
+  import("@/components/TaskGraph").then((module) => ({ default: module.TaskGraphView })),
+);
+const LazyTaskBoard = lazy(() =>
+  import("@/components/tasks/TaskBoard").then((module) => ({ default: module.TaskBoard })),
+);
+const LazyExportPlanDialog = lazy(() =>
+  import("@/components/Ideation/ExportPlanDialog").then((module) => ({
+    default: module.ExportPlanDialog,
+  })),
+);
+const LazyPlanDisplay = lazy(() =>
+  import("@/components/Ideation/PlanDisplay").then((module) => ({ default: module.PlanDisplay })),
+);
+const LazyPlanEditor = lazy(() =>
+  import("@/components/Ideation/PlanEditor").then((module) => ({ default: module.PlanEditor })),
+);
+const LazyPlanEmptyState = lazy(() =>
+  import("@/components/Ideation/PlanEmptyState").then((module) => ({
+    default: module.PlanEmptyState,
+  })),
+);
+const LazyProposalsTabContent = lazy(() =>
+  import("@/components/Ideation/ProposalsTabContent").then((module) => ({
+    default: module.ProposalsTabContent,
+  })),
+);
+const LazyVerificationPanel = lazy(() =>
+  import("@/components/Ideation/VerificationPanel").then((module) => ({
+    default: module.VerificationPanel,
+  })),
+);
 
 const ARTIFACT_TABS: Array<{
   id: AgentArtifactTab;
@@ -89,7 +109,7 @@ interface AgentsArtifactPaneProps {
   onClose: () => void;
 }
 
-export function AgentsArtifactPane({
+export const AgentsArtifactPane = memo(function AgentsArtifactPane({
   conversation,
   workspace = null,
   activeTab,
@@ -101,25 +121,53 @@ export function AgentsArtifactPane({
   onClose,
 }: AgentsArtifactPaneProps) {
   const queryClient = useQueryClient();
-  const conversationQuery = useConversation(conversation?.id ?? null, {
-    enabled: !!conversation?.id,
+  const showIdeationTabs = workspace?.mode === "ideation";
+  const showPublishTab =
+    workspace?.mode === "edit" && !workspace.linkedIdeationSessionId && !workspace.linkedPlanBranchId;
+  const shouldLoadIdeationData = showIdeationTabs;
+  const visibleTabs = useMemo(
+    () => [
+      ...(showIdeationTabs ? ARTIFACT_TABS : []),
+      ...(showPublishTab ? [PUBLISH_TAB] : []),
+    ],
+    [showIdeationTabs, showPublishTab],
+  );
+  const effectiveActiveTab =
+    visibleTabs.some((tab) => tab.id === activeTab)
+      ? activeTab
+      : showPublishTab
+        ? "publish"
+        : "plan";
+  const shouldLoadVerificationData =
+    shouldLoadIdeationData && effectiveActiveTab === "verification";
+  const shouldLoadDependencyGraph =
+    shouldLoadIdeationData &&
+    (effectiveActiveTab === "proposal" || effectiveActiveTab === "tasks");
+  const conversationQuery = useConversationHistoryWindow(conversation?.id ?? null, {
+    enabled: shouldLoadIdeationData && !!conversation?.id,
+    pageSize: 40,
   });
   const conversationData = conversationQuery.data;
   const conversationMessages = useMemo(
     () =>
-      conversationData && conversationData.conversation?.id === conversation?.id
+      shouldLoadIdeationData &&
+      conversationData &&
+      conversationData.conversation?.id === conversation?.id
         ? conversationData.messages
         : [],
-    [conversationData, conversation?.id],
+    [conversationData, conversation?.id, shouldLoadIdeationData],
   );
   const attachedSessionId = useMemo(
-    () => resolveAttachedIdeationSessionId(conversation, conversationMessages),
-    [conversation, conversationMessages],
+    () =>
+      shouldLoadIdeationData
+        ? resolveAttachedIdeationSessionId(conversation, conversationMessages)
+        : null,
+    [conversation, conversationMessages, shouldLoadIdeationData],
   );
   const sessionQuery = useQuery({
     queryKey: ideationKeys.sessionWithData(attachedSessionId ?? ""),
     queryFn: () => ideationApi.sessions.getWithData(attachedSessionId!),
-    enabled: !!attachedSessionId,
+    enabled: shouldLoadIdeationData && !!attachedSessionId,
     staleTime: 0,
     refetchInterval: (query) =>
       query.state.data?.session.verificationInProgress ||
@@ -137,16 +185,21 @@ export function AgentsArtifactPane({
     () => (sessionData?.proposals ?? []).map(toTaskProposal),
     [sessionData?.proposals],
   );
-  const planArtifactId =
-    sessionData?.session.planArtifactId ?? sessionData?.session.inheritedPlanArtifactId ?? null;
+  const planArtifactId = shouldLoadIdeationData
+    ? sessionData?.session.planArtifactId ?? sessionData?.session.inheritedPlanArtifactId ?? null
+    : null;
   const planArtifactQuery = useQuery({
     queryKey: ["agents", "artifact", planArtifactId],
     queryFn: () => artifactApi.get(planArtifactId!),
-    enabled: !!planArtifactId,
+    enabled: shouldLoadIdeationData && !!planArtifactId,
     staleTime: 5_000,
   });
-  const verificationQuery = useVerificationStatus(attachedSessionId ?? undefined);
-  const dependencyQuery = useDependencyGraph(attachedSessionId ?? "");
+  const verificationQuery = useVerificationStatus(
+    shouldLoadVerificationData ? attachedSessionId ?? undefined : undefined,
+  );
+  const dependencyQuery = useDependencyGraph(
+    shouldLoadDependencyGraph ? attachedSessionId ?? "" : "",
+  );
   const verificationData =
     attachedSessionId && verificationQuery.data?.sessionId === attachedSessionId
       ? verificationQuery.data
@@ -157,22 +210,6 @@ export function AgentsArtifactPane({
     verificationData?.status ?? sessionData?.session.verificationStatus ?? "unverified";
   const verificationInProgress =
     verificationData?.inProgress ?? sessionData?.session.verificationInProgress ?? false;
-  const showIdeationTabs = workspace?.mode === "ideation";
-  const showPublishTab =
-    workspace?.mode === "edit" && !workspace.linkedIdeationSessionId && !workspace.linkedPlanBranchId;
-  const visibleTabs = useMemo(
-    () => [
-      ...(showIdeationTabs ? ARTIFACT_TABS : []),
-      ...(showPublishTab ? [PUBLISH_TAB] : []),
-    ],
-    [showIdeationTabs, showPublishTab],
-  );
-  const effectiveActiveTab =
-    visibleTabs.some((tab) => tab.id === activeTab)
-      ? activeTab
-      : showPublishTab
-        ? "publish"
-        : "plan";
   const handlePlanUpdated = useCallback(
     (updatedPlan: Artifact) => {
       queryClient.setQueryData(["agents", "artifact", updatedPlan.id], updatedPlan);
@@ -368,7 +405,7 @@ export function AgentsArtifactPane({
       </div>
     </aside>
   );
-}
+});
 
 type ArtifactContentProps = {
   activeTab: AgentArtifactTab;
@@ -405,6 +442,11 @@ function ArtifactContent({
   onPublishWorkspace,
   isPublishingWorkspace,
 }: ArtifactContentProps) {
+  const criticalPathSet = useMemo(
+    () => new Set(dependencyGraph?.criticalPath ?? []),
+    [dependencyGraph?.criticalPath],
+  );
+
   if (activeTab === "publish") {
     return (
       <AgentPublishPanel
@@ -447,7 +489,9 @@ function ArtifactContent({
     }
     return (
       <div className="flex h-full min-h-0 flex-col">
-        <VerificationPanel session={session} />
+        <Suspense fallback={<EmptyArtifactState title="Loading verification..." />}>
+          <LazyVerificationPanel session={session} />
+        </Suspense>
       </div>
     );
   }
@@ -457,24 +501,26 @@ function ArtifactContent({
       return <EmptyArtifactState title="No proposals yet" />;
     }
     return (
-      <ProposalsTabContent
-        session={session}
-        proposals={proposals}
-        dependencyGraph={dependencyGraph}
-        criticalPathSet={new Set(dependencyGraph?.criticalPath ?? [])}
-        highlightedIds={EMPTY_PROPOSAL_HIGHLIGHTS}
-        isReadOnly
-        onEditProposal={noop}
-        onNavigateToTask={noop}
-        onViewHistoricalPlan={noop}
-        onImportPlan={noop}
-        onClearAll={noop}
-        onAcceptPlan={noop}
-        onReviewSync={noop}
-        onUndoSync={noop}
-        onDismissSync={noop}
-        hideToolbar
-      />
+      <Suspense fallback={<EmptyArtifactState title="Loading proposals..." />}>
+        <LazyProposalsTabContent
+          session={session}
+          proposals={proposals}
+          dependencyGraph={dependencyGraph}
+          criticalPathSet={criticalPathSet}
+          highlightedIds={EMPTY_PROPOSAL_HIGHLIGHTS}
+          isReadOnly
+          onEditProposal={noop}
+          onNavigateToTask={noop}
+          onViewHistoricalPlan={noop}
+          onImportPlan={noop}
+          onClearAll={noop}
+          onAcceptPlan={noop}
+          onReviewSync={noop}
+          onUndoSync={noop}
+          onDismissSync={noop}
+          hideToolbar
+        />
+      </Suspense>
     );
   }
 
@@ -484,412 +530,6 @@ function ArtifactContent({
       sessionId={attachedSessionId}
       mode={taskMode}
     />
-  );
-}
-
-function AgentPublishPanel({
-  workspace,
-  onPublishWorkspace,
-  isPublishingWorkspace,
-}: {
-  workspace: AgentConversationWorkspace | null;
-  onPublishWorkspace: ((conversationId: string) => Promise<void>) | undefined;
-  isPublishingWorkspace: boolean;
-}) {
-  const [reviewOpen, setReviewOpen] = useState(false);
-  const [commitFiles, setCommitFiles] = useState<DiffViewerFileChange[]>([]);
-  const conversationId = workspace?.conversationId ?? null;
-  const changesQuery = useQuery({
-    queryKey: ["agents", "workspace-diff", conversationId],
-    queryFn: () => diffApi.getAgentConversationWorkspaceFileChanges(conversationId!),
-    enabled: !!conversationId,
-    staleTime: 2_000,
-  });
-  const publicationEventsQuery = useQuery({
-    queryKey: ["agents", "conversation-workspace-publication-events", conversationId],
-    queryFn: () =>
-      chatApi.listAgentConversationWorkspacePublicationEvents(conversationId!),
-    enabled: !!conversationId,
-    staleTime: 0,
-    refetchInterval: isPublishingWorkspace ? 1_500 : false,
-  });
-  const changes = changesQuery.data ?? [];
-  const publicationEvents = publicationEventsQuery.data ?? [];
-
-  if (!workspace) {
-    return <EmptyArtifactState title="No workspace selected" />;
-  }
-
-  const branch = workspace.branchName;
-  const base = workspace.baseDisplayName ?? workspace.baseRef;
-  const prLabel = workspace.publicationPrNumber
-    ? `PR #${workspace.publicationPrNumber}`
-    : workspace.publicationPrUrl
-      ? "Published PR"
-      : "No PR yet";
-  const publishDisabled =
-    !onPublishWorkspace || isPublishingWorkspace || workspace.status === "missing";
-
-  return (
-    <div className="min-h-full p-4" data-testid="agents-publish-pane">
-      <div className="mx-auto flex max-w-3xl flex-col gap-4">
-        <section
-          className="rounded-lg border p-4"
-          style={{
-            background: "var(--bg-surface)",
-            borderColor: "var(--border-subtle)",
-          }}
-        >
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <div className="text-sm font-semibold text-[var(--text-primary)]">
-                Review Changes
-              </div>
-              <div className="mt-1 text-xs text-[var(--text-muted)]">
-                {base} → {branch}
-              </div>
-            </div>
-            <span
-              className="rounded-full border px-2.5 py-1 text-xs capitalize"
-              style={{
-                borderColor: "var(--overlay-weak)",
-                color: "var(--text-secondary)",
-              }}
-            >
-              {workspace.publicationPushStatus ?? workspace.status}
-            </span>
-          </div>
-
-          <div className="mt-4 grid gap-3 sm:grid-cols-2">
-            <PublishFact icon={GitBranch} label="Branch" value={branch} />
-            <PublishFact icon={FileText} label="Base" value={base} />
-            <PublishFact icon={GitPullRequestArrow} label="Pull Request" value={prLabel} />
-            <PublishFact
-              icon={CheckCircle2}
-              label="Mode"
-              value={workspace.mode === "edit" ? "Edit agent" : workspace.mode}
-            />
-          </div>
-          <PublishPipelineSteps
-            status={workspace.publicationPushStatus}
-            isPublishing={isPublishingWorkspace}
-          />
-          <PublishEventLog
-            events={publicationEvents}
-            isLoading={publicationEventsQuery.isLoading}
-          />
-        </section>
-
-        <section
-          className="rounded-lg border p-4"
-          style={{
-            background: "var(--bg-surface)",
-            borderColor: "var(--border-subtle)",
-          }}
-        >
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div>
-              <div className="text-sm font-semibold text-[var(--text-primary)]">
-                Commit & Publish
-              </div>
-              <div className="mt-1 text-xs leading-relaxed text-[var(--text-muted)]">
-                {changesQuery.isLoading
-                  ? "Loading changed files..."
-                  : changes.length > 0
-                    ? `${changes.length} changed file${changes.length === 1 ? "" : "s"} ready for review.`
-                    : "No changed files detected yet."}
-              </div>
-            </div>
-            <div className="flex items-center gap-2">
-              <Button
-                type="button"
-                variant="ghost"
-                className="h-9 gap-2 px-3 text-xs"
-                onClick={() => setReviewOpen(true)}
-                disabled={changesQuery.isLoading || changes.length === 0}
-                data-testid="agents-review-changes"
-              >
-                <Code className="h-3.5 w-3.5" />
-                Review Changes
-              </Button>
-              <Button
-                type="button"
-                className="h-9 gap-2 px-3 text-xs"
-                onClick={() => void onPublishWorkspace?.(workspace.conversationId)}
-                disabled={publishDisabled}
-                data-testid="agents-publish-confirm"
-              >
-                {isPublishingWorkspace ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <GitPullRequestArrow className="h-3.5 w-3.5" />
-                )}
-                Commit & Publish
-              </Button>
-            </div>
-          </div>
-        </section>
-      </div>
-      <Dialog open={reviewOpen} onOpenChange={setReviewOpen}>
-        <DialogContent
-          className="flex h-[95vh] w-[95vw] max-w-[95vw] flex-col gap-0 overflow-hidden p-0"
-          style={{
-            backgroundColor: "var(--bg-surface)",
-            border: "1px solid var(--border-subtle)",
-          }}
-        >
-          <DiffViewer
-            changes={changes}
-            commits={[]}
-            commitFiles={commitFiles}
-            onFetchDiff={async (filePath) => {
-              if (!conversationId) {
-                return null;
-              }
-              const diff = await diffApi.getAgentConversationWorkspaceFileDiff(
-                conversationId,
-                filePath,
-              );
-              return {
-                filePath: diff.filePath,
-                oldContent: diff.oldContent,
-                newContent: diff.newContent,
-                hunks: [],
-                language: diff.language,
-              };
-            }}
-            onFetchCommitFiles={async () => setCommitFiles([])}
-            isLoadingChanges={changesQuery.isLoading}
-            changesLabel="Workspace Changes"
-            changesEmptyTitle="No workspace changes"
-            changesEmptySubtitle="There are no changed files to review for this agent branch."
-          />
-        </DialogContent>
-      </Dialog>
-    </div>
-  );
-}
-
-function PublishEventLog({
-  events,
-  isLoading,
-}: {
-  events: AgentConversationWorkspacePublicationEvent[];
-  isLoading: boolean;
-}) {
-  if (isLoading && events.length === 0) {
-    return (
-      <div className="mt-4 text-xs text-[var(--text-muted)]">
-        Loading publish history...
-      </div>
-    );
-  }
-
-  if (events.length === 0) {
-    return null;
-  }
-
-  const recentEvents = events.slice(-6).reverse();
-
-  return (
-    <div className="mt-4" data-testid="agents-publish-events">
-      <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-[var(--text-muted)]">
-        Publish history
-      </div>
-      <div className="space-y-2">
-        {recentEvents.map((event) => (
-          <div
-            key={event.id}
-            className="flex items-start gap-2 text-xs"
-            data-testid={`agents-publish-event-${event.step}`}
-          >
-            <span
-              className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border"
-              style={{
-                borderColor:
-                  event.status === "failed"
-                    ? "var(--status-danger)"
-                    : event.status === "succeeded"
-                      ? "var(--status-success)"
-                      : "var(--overlay-weak)",
-                color:
-                  event.status === "failed"
-                    ? "var(--status-danger)"
-                    : event.status === "succeeded"
-                      ? "var(--status-success)"
-                      : "var(--text-muted)",
-              }}
-            >
-              {event.status === "failed" ? (
-                <X className="h-3 w-3" />
-              ) : event.status === "succeeded" ? (
-                <CheckCircle2 className="h-3 w-3" />
-              ) : (
-                <Loader2 className="h-3 w-3" />
-              )}
-            </span>
-            <div className="min-w-0">
-              <div className="font-medium text-[var(--text-primary)]">
-                {event.summary}
-              </div>
-              <div className="mt-0.5 text-[11px] capitalize text-[var(--text-muted)]">
-                {event.step.replace(/_/g, " ")}
-                {event.classification ? ` / ${event.classification.replace(/_/g, " ")}` : ""}
-              </div>
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-const PUBLISH_STEPS = [
-  { id: "checking", label: "Check workspace" },
-  { id: "committing", label: "Commit changes" },
-  { id: "refreshing", label: "Refresh branch" },
-  { id: "pushing", label: "Push branch" },
-  { id: "pushed", label: "Open draft PR" },
-] as const;
-
-function PublishPipelineSteps({
-  status,
-  isPublishing,
-}: {
-  status: string | null;
-  isPublishing: boolean;
-}) {
-  const normalizedStatus = status ?? "idle";
-  const activeIndex = (() => {
-    if (normalizedStatus === "pushed") {
-      return PUBLISH_STEPS.length;
-    }
-    if (normalizedStatus === "pushing") {
-      return 3;
-    }
-    if (normalizedStatus === "refreshing") {
-      return 2;
-    }
-    if (normalizedStatus === "committing") {
-      return 1;
-    }
-    return 0;
-  })();
-  const isRepairStatus = normalizedStatus === "needs_agent";
-  const isTerminalFailure = normalizedStatus === "failed" || isRepairStatus;
-
-  return (
-    <div
-      className="mt-4 rounded-md border p-3"
-      style={{
-        background: "var(--bg-subtle)",
-        borderColor: "var(--border-subtle)",
-      }}
-      data-testid="agents-publish-pipeline"
-    >
-      <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-[var(--text-muted)]">
-        Publish pipeline
-      </div>
-      <div className="grid gap-2 sm:grid-cols-5">
-        {PUBLISH_STEPS.map((step, index) => {
-          const isDone = activeIndex > index;
-          const isActive = isPublishing && activeIndex === index;
-          const isFailed = isTerminalFailure && index === 0;
-          return (
-            <div
-              key={step.id}
-              className="flex items-center gap-2 text-xs"
-              data-testid={`agents-publish-step-${step.id}`}
-              style={{
-                color:
-                  isDone || isActive || isFailed
-                    ? "var(--text-primary)"
-                    : "var(--text-muted)",
-              }}
-            >
-              <span
-                className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full border"
-                style={{
-                  borderColor: isFailed
-                    ? "var(--status-danger)"
-                    : isDone
-                      ? "var(--status-success)"
-                      : isActive
-                        ? "var(--accent-primary)"
-                        : "var(--overlay-weak)",
-                  color: isFailed
-                    ? "var(--status-danger)"
-                    : isDone
-                      ? "var(--status-success)"
-                      : isActive
-                        ? "var(--accent-primary)"
-                        : "var(--text-muted)",
-                }}
-              >
-                {isActive ? (
-                  <Loader2 className="h-3 w-3 animate-spin" />
-                ) : isDone ? (
-                  <CheckCircle2 className="h-3 w-3" />
-                ) : isFailed ? (
-                  <X className="h-3 w-3" />
-                ) : (
-                  index + 1
-                )}
-              </span>
-              <span>{step.label}</span>
-            </div>
-          );
-        })}
-      </div>
-      {isTerminalFailure && (
-        <div className="mt-3 text-xs text-[var(--text-muted)]">
-          {isRepairStatus
-            ? "The latest publish attempt found a fixable issue and sent it back to the workspace agent."
-            : "The latest publish attempt failed. Fixable errors are sent back to the workspace agent."}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function PublishFact({
-  icon: Icon,
-  label,
-  value,
-}: {
-  icon: ElementType;
-  label: string;
-  value: string;
-}) {
-  return (
-    <div
-      className="flex min-w-0 items-start gap-2 rounded-md border px-3 py-2"
-      style={{
-        background: "var(--bg-base)",
-        borderColor: "var(--overlay-weak)",
-      }}
-    >
-      <Icon className="mt-0.5 h-4 w-4 shrink-0 text-[var(--text-muted)]" />
-      <div className="min-w-0">
-        <div className="text-[10px] font-medium uppercase tracking-[0.14em] text-[var(--text-muted)]">
-          {label}
-        </div>
-        <div className="mt-1 truncate text-xs font-medium text-[var(--text-primary)]">
-          {value}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function EmptyArtifactState({ title, detail }: { title: string; detail?: string | undefined }) {
-  return (
-    <div className="h-full min-h-[220px] flex items-center justify-center p-6 text-center">
-      <div className="max-w-sm">
-        <div className="text-sm font-medium text-[var(--text-primary)]">{title}</div>
-        {detail && <div className="mt-2 text-xs leading-relaxed text-[var(--text-muted)]">{detail}</div>}
-      </div>
-    </div>
   );
 }
 
@@ -947,40 +587,48 @@ function AgentPlanPanel({
     <div className="min-h-full p-4">
       {planArtifact ? (
         isEditing ? (
-          <PlanEditor
-            plan={planArtifact}
-            onSave={(updated) => {
-              onPlanUpdated(updated);
-              setIsEditing(false);
-            }}
-            onCancel={() => setIsEditing(false)}
-          />
+          <Suspense fallback={<EmptyArtifactState title="Loading plan editor..." />}>
+            <LazyPlanEditor
+              plan={planArtifact}
+              onSave={(updated) => {
+                onPlanUpdated(updated);
+                setIsEditing(false);
+              }}
+              onCancel={() => setIsEditing(false)}
+            />
+          </Suspense>
         ) : (
-          <PlanDisplay
-            plan={planArtifact}
-            linkedProposalsCount={proposals.filter((proposal) => proposal.planArtifactId === planArtifact.id).length}
-            onEdit={() => setIsEditing(true)}
-            onExport={() => setExportDialogOpen(true)}
-            isExpanded={isPlanExpanded}
-            onExpandedChange={setIsPlanExpanded}
-            {...(teamMetadata !== undefined && { teamMetadata })}
-            {...(session !== null && { onCreateProposals: handleCreateProposals })}
-          />
+          <Suspense fallback={<EmptyArtifactState title="Loading plan..." />}>
+            <LazyPlanDisplay
+              plan={planArtifact}
+              linkedProposalsCount={proposals.filter((proposal) => proposal.planArtifactId === planArtifact.id).length}
+              onEdit={() => setIsEditing(true)}
+              onExport={() => setExportDialogOpen(true)}
+              isExpanded={isPlanExpanded}
+              onExpandedChange={setIsPlanExpanded}
+              {...(teamMetadata !== undefined && { teamMetadata })}
+              {...(session !== null && { onCreateProposals: handleCreateProposals })}
+            />
+          </Suspense>
         )
       ) : (
-        <PlanEmptyState />
+        <Suspense fallback={<EmptyArtifactState title="Loading plan..." />}>
+          <LazyPlanEmptyState />
+        </Suspense>
       )}
 
-      {session && (
-        <ExportPlanDialog
-          open={exportDialogOpen}
-          onOpenChange={setExportDialogOpen}
-          sessionId={session.id}
-          sessionTitle={sessionTitle}
-          verificationStatus={session.verificationStatus ?? "unverified"}
-          planArtifact={planArtifact}
-          projectId={session.projectId}
-        />
+      {session && exportDialogOpen && (
+        <Suspense fallback={null}>
+          <LazyExportPlanDialog
+            open={exportDialogOpen}
+            onOpenChange={setExportDialogOpen}
+            sessionId={session.id}
+            sessionTitle={sessionTitle}
+            verificationStatus={session.verificationStatus ?? "unverified"}
+            planArtifact={planArtifact}
+            projectId={session.projectId}
+          />
+        </Suspense>
       )}
     </div>
   );
@@ -1002,18 +650,22 @@ function TaskArtifactSurface({
   if (mode === "kanban") {
     return (
       <div className="h-full min-h-[520px] overflow-hidden bg-[var(--bg-base)]">
-        <TaskBoard projectId={projectId} ideationSessionId={sessionId} />
+        <Suspense fallback={<EmptyArtifactState title="Loading task board..." />}>
+          <LazyTaskBoard projectId={projectId} ideationSessionId={sessionId} />
+        </Suspense>
       </div>
     );
   }
 
   return (
     <div className="h-full min-h-[520px] overflow-hidden bg-[var(--bg-base)]">
-      <TaskGraphView
-        projectId={projectId}
-        ideationSessionId={sessionId}
-        hideCanvasControls
-      />
+      <Suspense fallback={<EmptyArtifactState title="Loading task graph..." />}>
+        <LazyTaskGraphView
+          projectId={projectId}
+          ideationSessionId={sessionId}
+          hideCanvasControls
+        />
+      </Suspense>
     </div>
   );
 }

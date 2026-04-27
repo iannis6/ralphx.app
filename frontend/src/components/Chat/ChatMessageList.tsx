@@ -9,13 +9,14 @@
  */
 
 import React, { forwardRef, useCallback, useEffect, useMemo, useRef, useState, useImperativeHandle } from "react";
-import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
+import { Virtuoso, type ListRange, type VirtuosoHandle } from "react-virtuoso";
 import { MessageItem } from "./MessageItem";
 import { HookEventMessage } from "./HookEventMessage";
 import { AutoVerificationCard } from "./AutoVerificationCard";
 import { VerificationResultCard } from "./VerificationResultCard";
 import { AUTO_VERIFICATION_KEY, VERIFICATION_RESULT_KEY } from "@/types/ideation";
 import {
+  ConversationTranscriptPlaceholders,
   TypingIndicator,
   FailedRunBanner,
 } from "./IntegratedChatPanel.components";
@@ -32,7 +33,6 @@ import { shouldUseWebkitSafeScrollBehavior } from "@/lib/platform-quirks";
 import { logger } from "@/lib/logger";
 import { useMessageAttachments } from "@/hooks/useMessageAttachments";
 import { ChevronDown } from "lucide-react";
-import { Button } from "@/components/ui/button";
 import type { MessageAttachment } from "./MessageAttachments";
 import { useTeamStore, selectTeammateByName, selectTeamMessages, EMPTY_TEAM_MESSAGES } from "@/stores/teamStore";
 import { ToolCallStoreKeyContext } from "./tool-widgets/ToolCallStoreKeyContext";
@@ -42,6 +42,14 @@ import { TeamMessageBubble } from "./TeamMessageBubble";
 import { isProviderRole } from "@/lib/chat/provider-role";
 import { normalizeStreamingVerificationContentBlocks } from "./verification-tool-calls";
 import { cn } from "@/lib/utils";
+import { isTranscriptRootReadyForReveal } from "./ChatMessageList.readiness";
+import {
+  getScrollBottomDelta,
+  getTrueBottomScrollTop,
+  isScrollElementVisuallyAtBottom,
+  shouldShowScrollToBottomControl,
+  VISUAL_BOTTOM_EPSILON_PX,
+} from "./ChatMessageList.scroll";
 
 // ============================================================================
 // Constants
@@ -57,6 +65,8 @@ export const AT_BOTTOM_THRESHOLD = 150;
 /** Bucket size for text length change detection during streaming.
  *  ~2 visible lines per trigger (average line ~80 chars at standard chat width → 2 lines × 80 = 160, rounded to 150). */
 export const TEXT_LENGTH_BUCKET_SIZE = 150;
+
+const INITIAL_TRANSCRIPT_PAINT_MAX_FRAMES = 240;
 
 /** Shared styles for content containers to handle long text */
 const contentContainerStyle: React.CSSProperties = {
@@ -80,6 +90,64 @@ function ContentShell({
       {children}
     </div>
   );
+}
+
+function ScrollToBottomControl({
+  visible,
+  onClick,
+  onWheel,
+}: {
+  visible: boolean;
+  onClick: () => void;
+  onWheel: React.WheelEventHandler<HTMLButtonElement>;
+}) {
+  return (
+    <div
+      data-testid="chat-scroll-to-bottom-control"
+      aria-hidden={!visible}
+      className={cn(
+        "absolute bottom-4 left-0 right-0 z-10 flex justify-center pointer-events-none",
+        visible ? "opacity-100" : "opacity-0",
+      )}
+      style={{
+        contain: "layout paint style",
+      }}
+    >
+      <button
+        type="button"
+        data-testid="chat-scroll-to-bottom-button"
+        onClick={onClick}
+        onWheel={onWheel}
+        disabled={!visible}
+        tabIndex={visible ? 0 : -1}
+        className={cn(
+          "inline-flex h-8 items-center gap-1.5 rounded-md border px-3 text-xs font-medium",
+          "bg-[color-mix(in_srgb,var(--bg-surface)_72%,var(--bg-base))]",
+          "border-[color-mix(in_srgb,var(--border-subtle)_45%,var(--text-muted))]",
+          "text-[var(--text-primary)] hover:bg-[color-mix(in_srgb,var(--bg-surface)_58%,var(--bg-base))]",
+          "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-primary)]",
+          visible ? "pointer-events-auto cursor-pointer" : "pointer-events-none cursor-default",
+        )}
+      >
+        <span>Scroll to bottom</span>
+        <ChevronDown className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+      </button>
+    </div>
+  );
+}
+
+function scrollElementByDelta(element: HTMLElement, deltaX: number, deltaY: number) {
+  if (typeof element.scrollBy === "function") {
+    element.scrollBy({
+      left: deltaX,
+      top: deltaY,
+      behavior: "auto",
+    });
+    return;
+  }
+
+  element.scrollLeft += deltaX;
+  element.scrollTop += deltaY;
 }
 
 /** Stable empty arrays — avoids new refs on each render when props are omitted */
@@ -212,6 +280,8 @@ interface ChatMessageListProps {
   hasOlderMessages?: boolean;
   isFetchingOlderMessages?: boolean;
   onLoadOlderMessages?: (() => void | Promise<void>) | undefined;
+  initialPaintCoverKey?: string | null | undefined;
+  onInitialPaintReady?: ((key: string) => void) | undefined;
 }
 
 // ============================================================================
@@ -243,6 +313,8 @@ export const ChatMessageList = forwardRef<VirtuosoHandle, ChatMessageListProps>(
       hasOlderMessages = false,
       isFetchingOlderMessages = false,
       onLoadOlderMessages,
+      initialPaintCoverKey = null,
+      onInitialPaintReady,
     },
     ref
   ) {
@@ -255,6 +327,7 @@ export const ChatMessageList = forwardRef<VirtuosoHandle, ChatMessageListProps>(
     // Internal ref for scroll operations
     const virtuosoRef = useRef<VirtuosoHandle>(null);
     const hasScrolledRef = useRef<string | null>(null);
+    const previousLastItemIndexRef = useRef<number | null>(null);
     // Track previous shouldFilterLastAssistant to detect false→true→false transition
     const prevShouldFilterRef = useRef(false);
     const bottomPinRafIdsRef = useRef<number[]>([]);
@@ -266,7 +339,14 @@ export const ChatMessageList = forwardRef<VirtuosoHandle, ChatMessageListProps>(
     // rAF reconciliation refs — used to keep isAtBottom accurate when footer grows
     const scrollerElRef = useRef<HTMLElement | null>(null);
     const reconcileRafRef = useRef<number | null>(null);
+    const scrollerResizeObserverRef = useRef<ResizeObserver | null>(null);
+    const scrollerResizeRafRef = useRef<number | null>(null);
     const isTestEnv = import.meta.env.VITEST;
+    const [isVisuallyAtBottom, setIsVisuallyAtBottomState] = useState(true);
+    const isVisuallyAtBottomRef = useRef(true);
+    const [hasScrollerElement, setHasScrollerElement] = useState(false);
+    const [hasScrollableOverflow, setHasScrollableOverflow] = useState(false);
+    const [isLastItemVisible, setIsLastItemVisible] = useState<boolean | null>(true);
 
     // Footer ResizeObserver refs — for height-driven auto-scroll (G2 fix)
     const footerElRef = useRef<HTMLDivElement | null>(null);
@@ -275,6 +355,84 @@ export const ChatMessageList = forwardRef<VirtuosoHandle, ChatMessageListProps>(
     const footerPrevHeightRef = useRef<number>(-1); // -1 = uninitialized sentinel
     const footerMountedRef = useRef(false); // H2 fix: skip initial mount observation
     const hasFooterStreamingContentRef = useRef(false);
+    const transcriptRootRef = useRef<HTMLDivElement | null>(null);
+    const initialPaintReadyFrameRef = useRef<number | null>(null);
+    const initialPaintReadyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const initialPaintReadyAttemptRef = useRef(0);
+    const [pendingInitialPaintCoverKey, setPendingInitialPaintCoverKey] =
+      useState<string | null>(() => (initialPaintCoverKey && messages.length > 0 ? initialPaintCoverKey : null));
+    const shouldShowInitialPaintCover =
+      pendingInitialPaintCoverKey !== null && messages.length > 0;
+
+    const setIsVisuallyAtBottom = useCallback((nextValue: boolean) => {
+      if (isVisuallyAtBottomRef.current === nextValue) {
+        return;
+      }
+      isVisuallyAtBottomRef.current = nextValue;
+      setIsVisuallyAtBottomState(nextValue);
+    }, []);
+
+    const cancelInitialPaintReadyJob = useCallback(() => {
+      if (initialPaintReadyFrameRef.current !== null) {
+        cancelAnimationFrame(initialPaintReadyFrameRef.current);
+        initialPaintReadyFrameRef.current = null;
+      }
+      if (initialPaintReadyTimerRef.current !== null) {
+        clearTimeout(initialPaintReadyTimerRef.current);
+        initialPaintReadyTimerRef.current = null;
+      }
+      initialPaintReadyAttemptRef.current = 0;
+    }, []);
+
+    useEffect(
+      () => () => cancelInitialPaintReadyJob(),
+      [cancelInitialPaintReadyJob],
+    );
+
+    useEffect(() => {
+      cancelInitialPaintReadyJob();
+      setPendingInitialPaintCoverKey(
+        initialPaintCoverKey && messages.length > 0 ? initialPaintCoverKey : null,
+      );
+    }, [cancelInitialPaintReadyJob, initialPaintCoverKey, messages.length]);
+
+    const isTranscriptDomReady = useCallback(() => {
+      return isTranscriptRootReadyForReveal(transcriptRootRef.current);
+    }, []);
+
+    const scheduleInitialPaintReadyCheck = useCallback(() => {
+      if (!pendingInitialPaintCoverKey) {
+        return;
+      }
+      if (initialPaintReadyFrameRef.current !== null || initialPaintReadyTimerRef.current !== null) {
+        return;
+      }
+
+      const complete = () => {
+        const readyKey = pendingInitialPaintCoverKey;
+        initialPaintReadyTimerRef.current = null;
+        initialPaintReadyAttemptRef.current = 0;
+        setPendingInitialPaintCoverKey(null);
+        onInitialPaintReady?.(readyKey);
+      };
+
+      const check = () => {
+        initialPaintReadyFrameRef.current = null;
+        initialPaintReadyAttemptRef.current += 1;
+
+        if (
+          !isTranscriptDomReady() &&
+          initialPaintReadyAttemptRef.current < INITIAL_TRANSCRIPT_PAINT_MAX_FRAMES
+        ) {
+          initialPaintReadyFrameRef.current = requestAnimationFrame(check);
+          return;
+        }
+
+        initialPaintReadyTimerRef.current = setTimeout(complete, 0);
+      };
+
+      initialPaintReadyFrameRef.current = requestAnimationFrame(check);
+    }, [isTranscriptDomReady, onInitialPaintReady, pendingInitialPaintCoverKey]);
 
     useEffect(() => {
       conversationLastUserMessageIdRef.current = lastUserMessageId;
@@ -291,8 +449,9 @@ export const ChatMessageList = forwardRef<VirtuosoHandle, ChatMessageListProps>(
     );
     const teamMessages = useTeamStore(teamMsgSelector);
 
-    // Fetch attachments for all messages
-    const { data: attachmentsMap } = useMessageAttachments(messages, conversationId);
+    const { data: attachmentsMap } = useMessageAttachments(messages, conversationId, {
+      enabled: !shouldShowInitialPaintCover,
+    });
     const normalizedStreamingContentBlocks = useMemo(
       () => normalizeStreamingVerificationContentBlocks(streamingContentBlocks),
       [streamingContentBlocks],
@@ -360,17 +519,6 @@ export const ChatMessageList = forwardRef<VirtuosoHandle, ChatMessageListProps>(
       textLengthBucket: Math.floor(cumulativeTextLength / TEXT_LENGTH_BUCKET_SIZE),
     }), [streamingToolCalls, totalChildCalls, streamingTasks?.size, normalizedStreamingContentBlocks.length, cumulativeTextLength]);
 
-    // Streaming auto-scroll — followOutput only fires on totalCount changes,
-    // NOT on Footer height growth. Call autoscrollToBottom() imperatively when
-    // footer content changes to keep the view pinned during streaming.
-    useEffect(() => {
-      // Only react while the streaming footer actually has live content.
-      // When finalization clears footer state, followOutput/query refresh handle
-      // the message swap; forcing another footer scroll here creates overlap.
-      if (scrollToTimestamp || !hasFooterStreamingContent) return;
-      virtuosoRef.current?.autoscrollToBottom();
-    }, [footerContentHash, hasFooterStreamingContent, scrollToTimestamp]);
-
     // Unified auto-scroll hook — Virtuoso followOutput handles new-message scroll,
     // while the useEffect above handles streaming footer growth.
     const {
@@ -398,9 +546,10 @@ export const ChatMessageList = forwardRef<VirtuosoHandle, ChatMessageListProps>(
         if (!el) {
           logger.debug("[ChatScroll] scrollToTrueBottom: no scroller ref yet, falling back to scrollToBottom hook");
           scrollToBottom();
+          setIsVisuallyAtBottom(true);
           return;
         }
-        const target = el.scrollHeight - el.clientHeight;
+        const target = getTrueBottomScrollTop(el);
         logger.debug("[ChatScroll] scrollToTrueBottom", {
           scrollHeight: el.scrollHeight,
           clientHeight: el.clientHeight,
@@ -409,20 +558,21 @@ export const ChatMessageList = forwardRef<VirtuosoHandle, ChatMessageListProps>(
           behavior,
         });
         el.scrollTo({ top: target, behavior });
+        setIsVisuallyAtBottom(true);
         // Eagerly mark atBottom=true so followOutput re-engages without waiting
         // for scrollend.
         if (!isAtBottomRef.current) {
           handleAtBottomStateChange(true);
         }
       },
-      [scrollToBottom, handleAtBottomStateChange, isAtBottomRef]
+      [scrollToBottom, setIsVisuallyAtBottom, handleAtBottomStateChange, isAtBottomRef]
     );
 
     // After any layout-changing event that should land at bottom, run two
     // passes — first on next frame (catches most cases), second after a short
     // delay (catches late-arriving streaming footer height growth).
     const scheduleBottomPin = useCallback(
-      (reason: string) => {
+      (reason: string, behavior: ScrollBehavior = preferredScrollBehavior) => {
         logger.debug(`[ChatScroll] scheduleBottomPin: ${reason}`);
         for (const rafId of bottomPinRafIdsRef.current) {
           cancelAnimationFrame(rafId);
@@ -438,11 +588,11 @@ export const ChatMessageList = forwardRef<VirtuosoHandle, ChatMessageListProps>(
 
           const innerRafId = requestAnimationFrame(() => {
             bottomPinRafIdsRef.current = bottomPinRafIdsRef.current.filter((id) => id !== innerRafId);
-            scrollToTrueBottom("smooth");
+            scrollToTrueBottom(behavior);
             // Second pass catches footer that grows in the same tick.
             bottomPinTimeoutRef.current = setTimeout(() => {
               bottomPinTimeoutRef.current = null;
-              scrollToTrueBottom("smooth");
+              scrollToTrueBottom(behavior);
             }, 120);
           });
 
@@ -451,8 +601,18 @@ export const ChatMessageList = forwardRef<VirtuosoHandle, ChatMessageListProps>(
 
         bottomPinRafIdsRef.current.push(outerRafId);
       },
-      [scrollToTrueBottom]
+      [preferredScrollBehavior, scrollToTrueBottom]
     );
+
+    // Streaming auto-scroll — followOutput only fires on totalCount changes,
+    // NOT on Footer height growth. Pin to the true DOM bottom when the user was
+    // already visually at bottom so footer/meta growth is included.
+    useEffect(() => {
+      if (scrollToTimestamp || !hasFooterStreamingContent) return;
+      if (isVisuallyAtBottomRef.current) {
+        scrollToTrueBottom("auto");
+      }
+    }, [footerContentHash, hasFooterStreamingContent, scrollToTimestamp, scrollToTrueBottom]);
 
     useEffect(() => {
       return () => {
@@ -476,9 +636,13 @@ export const ChatMessageList = forwardRef<VirtuosoHandle, ChatMessageListProps>(
         clearTimeout(bottomPinTimeoutRef.current);
         bottomPinTimeoutRef.current = null;
       }
+      setIsVisuallyAtBottom(true);
+      setHasScrollableOverflow(false);
+      setIsLastItemVisible(true);
+      previousLastItemIndexRef.current = null;
       lastUserMessageIdRef.current = conversationLastUserMessageIdRef.current;
       agentRunningRef.current = conversationAgentRunningRef.current;
-    }, [conversationId]);
+    }, [conversationId, setIsVisuallyAtBottom]);
 
     // Trigger 1: new user message appended → always jump to true bottom.
     useEffect(() => {
@@ -509,19 +673,66 @@ export const ChatMessageList = forwardRef<VirtuosoHandle, ChatMessageListProps>(
     // rAF-throttled DOM reconciliation — keeps isAtBottom accurate when Virtuoso doesn't detect footer growth.
     // Runs outside React render cycle (DOM event handler, not useEffect) — no render loop risk.
     // rAF fires post-paint, so scrollHeight reads don't force layout recalc during React commit phase.
+    const reconcileScrollerBottomState = useCallback(() => {
+      const el = scrollerElRef.current;
+      if (!el) return;
+
+      const bottomDelta = getScrollBottomDelta(el);
+      const atBottom = bottomDelta < AT_BOTTOM_THRESHOLD;
+      const visuallyAtBottom = bottomDelta <= VISUAL_BOTTOM_EPSILON_PX;
+      setHasScrollableOverflow(
+        el.scrollHeight > el.clientHeight + VISUAL_BOTTOM_EPSILON_PX
+      );
+      setIsVisuallyAtBottom(visuallyAtBottom);
+
+      // Only reconcile if state disagrees — avoids unnecessary setState
+      if (atBottom !== isAtBottomRef.current) {
+        handleAtBottomStateChange(atBottom);
+      }
+    }, [handleAtBottomStateChange, isAtBottomRef, setIsVisuallyAtBottom]);
+
     const handleScrollReconcile = useCallback(() => {
       if (reconcileRafRef.current) return; // Already scheduled — skip
       reconcileRafRef.current = requestAnimationFrame(() => {
         reconcileRafRef.current = null;
-        const el = scrollerElRef.current;
-        if (!el) return;
-        const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < AT_BOTTOM_THRESHOLD;
-        // Only reconcile if state disagrees — avoids unnecessary setState
-        if (atBottom !== isAtBottomRef.current) {
-          handleAtBottomStateChange(atBottom);
-        }
+        reconcileScrollerBottomState();
       });
-    }, [handleAtBottomStateChange, isAtBottomRef]);
+    }, [reconcileScrollerBottomState]);
+
+    const handleVirtuosoAtBottomStateChange = useCallback(
+      (atBottom: boolean) => {
+        const el = scrollerElRef.current;
+        setIsVisuallyAtBottom(
+          atBottom && el ? isScrollElementVisuallyAtBottom(el) : atBottom
+        );
+        handleAtBottomStateChange(atBottom);
+      },
+      [handleAtBottomStateChange, setIsVisuallyAtBottom],
+    );
+
+    const handleScrollerResize = useCallback(() => {
+      const wasVisuallyAtBottom = isVisuallyAtBottomRef.current;
+      if (scrollerResizeRafRef.current !== null) {
+        cancelAnimationFrame(scrollerResizeRafRef.current);
+      }
+      scrollerResizeRafRef.current = requestAnimationFrame(() => {
+        scrollerResizeRafRef.current = null;
+        if (wasVisuallyAtBottom && !scrollToTimestampRef.current) {
+          scrollToTrueBottom("auto");
+          return;
+        }
+        reconcileScrollerBottomState();
+      });
+    }, [reconcileScrollerBottomState, scrollToTrueBottom]);
+
+    const disconnectScrollerResizeObserver = useCallback(() => {
+      scrollerResizeObserverRef.current?.disconnect();
+      scrollerResizeObserverRef.current = null;
+      if (scrollerResizeRafRef.current !== null) {
+        cancelAnimationFrame(scrollerResizeRafRef.current);
+        scrollerResizeRafRef.current = null;
+      }
+    }, []);
 
     // Attach passive scroll listener to Virtuoso's scroller element.
     // Passed to Virtuoso's scrollerRef prop so we capture the actual scroll container.
@@ -531,22 +742,43 @@ export const ChatMessageList = forwardRef<VirtuosoHandle, ChatMessageListProps>(
           scrollerElRef.current.removeEventListener("scroll", handleScrollReconcile);
           scrollerElRef.current = null;
         }
+        setHasScrollerElement(false);
+        setHasScrollableOverflow(false);
+        disconnectScrollerResizeObserver();
         return;
       }
       if (scrollerElRef.current && scrollerElRef.current !== el) {
         scrollerElRef.current.removeEventListener("scroll", handleScrollReconcile);
+        disconnectScrollerResizeObserver();
+      }
+      if (scrollerElRef.current === el) {
+        reconcileScrollerBottomState();
+        return;
       }
       scrollerElRef.current = el;
+      setHasScrollerElement(true);
       el.addEventListener("scroll", handleScrollReconcile, { passive: true });
-    }, [handleScrollReconcile]);
+      reconcileScrollerBottomState();
+      if (typeof ResizeObserver !== "undefined") {
+        const observer = new ResizeObserver(handleScrollerResize);
+        observer.observe(el);
+        scrollerResizeObserverRef.current = observer;
+      }
+    }, [
+      disconnectScrollerResizeObserver,
+      handleScrollReconcile,
+      handleScrollerResize,
+      reconcileScrollerBottomState,
+    ]);
 
     // Cleanup rAF and scroll listener on unmount
     useEffect(() => {
       return () => {
         if (reconcileRafRef.current) cancelAnimationFrame(reconcileRafRef.current);
         scrollerElRef.current?.removeEventListener("scroll", handleScrollReconcile);
+        disconnectScrollerResizeObserver();
       };
-    }, [handleScrollReconcile]);
+    }, [disconnectScrollerResizeObserver, handleScrollReconcile]);
 
     // Stable callback ref for Footer element — creates ResizeObserver that detects footer height
     // changes (G2 fix: card expansion during streaming). Empty deps ensures observer is never
@@ -594,15 +826,15 @@ export const ChatMessageList = forwardRef<VirtuosoHandle, ChatMessageListProps>(
           // Read from refs — always current, no stale closure
           if (
             hasFooterStreamingContentRef.current &&
-            isAtBottomRef.current &&
+            isVisuallyAtBottomRef.current &&
             !scrollToTimestampRef.current
           ) {
-            virtuosoRef.current?.autoscrollToBottom();
+            scrollToTrueBottom("auto");
           }
         });
       });
       footerObserverRef.current.observe(el);
-    }, [isAtBottomRef]); // isAtBottomRef is a stable ref — included to satisfy exhaustive-deps without changing behavior
+    }, [scrollToTrueBottom]);
 
     // Cleanup Footer ResizeObserver and rAF on unmount
     useEffect(() => {
@@ -665,10 +897,10 @@ export const ChatMessageList = forwardRef<VirtuosoHandle, ChatMessageListProps>(
     useEffect(() => {
       if (scrollToTimestamp) return; // Don't auto-scroll in history mode
       if (prevShouldFilterRef.current && !shouldFilterLastProviderMessage) {
-        scrollToBottom();
+        scheduleBottomPin("finalized provider message revealed");
       }
       prevShouldFilterRef.current = shouldFilterLastProviderMessage;
-    }, [shouldFilterLastProviderMessage, scrollToBottom, scrollToTimestamp]);
+    }, [scheduleBottomPin, shouldFilterLastProviderMessage, scrollToTimestamp]);
 
     const timeline = useMemo((): TimelineItem[] => {
       const items: TimelineItem[] = [];
@@ -768,6 +1000,52 @@ export const ChatMessageList = forwardRef<VirtuosoHandle, ChatMessageListProps>(
             void onLoadOlderMessages();
           }
         : null;
+    const shouldShowScrollToBottom = shouldShowScrollToBottomControl({
+      hasScrollerElement,
+      hasScrollableOverflow,
+      isAtBottom,
+      isLastItemVisible,
+      isVisuallyAtBottom,
+      scrollToTimestamp,
+      timelineLength: timeline.length,
+    });
+    const handleScrollToBottomClick = useCallback(() => {
+      scrollToTrueBottom(preferredScrollBehavior);
+      scheduleBottomPin("manual scroll-to-bottom", preferredScrollBehavior);
+    }, [preferredScrollBehavior, scheduleBottomPin, scrollToTrueBottom]);
+    const handleScrollToBottomWheel = useCallback(
+      (event: React.WheelEvent<HTMLButtonElement>) => {
+        if (!shouldShowScrollToBottom) {
+          return;
+        }
+        const el = scrollerElRef.current ?? (isTestEnv ? transcriptRootRef.current : null);
+        if (!el) {
+          return;
+        }
+
+        event.preventDefault();
+        scrollElementByDelta(el, event.deltaX, event.deltaY);
+        handleScrollReconcile();
+      },
+      [handleScrollReconcile, isTestEnv, shouldShowScrollToBottom],
+    );
+
+    const handleRangeChanged = useCallback(
+      (range: ListRange) => {
+        if (timeline.length > 0 && range.endIndex >= range.startIndex) {
+          setIsLastItemVisible(range.endIndex >= lastItemIndex);
+          scheduleInitialPaintReadyCheck();
+        }
+      },
+      [lastItemIndex, scheduleInitialPaintReadyCheck, timeline.length],
+    );
+
+    useEffect(() => {
+      if (!shouldShowInitialPaintCover) {
+        return;
+      }
+      scheduleInitialPaintReadyCheck();
+    }, [scheduleInitialPaintReadyCheck, shouldShowInitialPaintCover]);
 
     // Initial load scroll — fires when conversation changes and timeline populates.
     // Uses one-shot ResizeObserver on the scroller element to detect when virtual
@@ -790,6 +1068,7 @@ export const ChatMessageList = forwardRef<VirtuosoHandle, ChatMessageListProps>(
           align: "end",
           behavior: "auto",
         });
+        scheduleBottomPin("initial conversation load", "auto");
         hasScrolledRef.current = targetScrollKey;
       };
 
@@ -822,7 +1101,25 @@ export const ChatMessageList = forwardRef<VirtuosoHandle, ChatMessageListProps>(
         clearTimeout(debounceTimer);
         clearTimeout(safetyTimer);
       };
-    }, [conversationId, lastItemIndex, timeline.length]);
+    }, [conversationId, lastItemIndex, scheduleBottomPin, timeline.length]);
+
+    useEffect(() => {
+      const previousLastItemIndex = previousLastItemIndexRef.current;
+      previousLastItemIndexRef.current = lastItemIndex;
+
+      if (
+        scrollToTimestamp ||
+        timeline.length === 0 ||
+        previousLastItemIndex === null ||
+        lastItemIndex <= previousLastItemIndex
+      ) {
+        return;
+      }
+
+      if (isVisuallyAtBottomRef.current) {
+        scheduleBottomPin("new timeline item appended");
+      }
+    }, [lastItemIndex, scheduleBottomPin, scrollToTimestamp, timeline.length]);
 
     const footerContent = useMemo(() => {
       if (!hasFooterStreamingContent) {
@@ -1048,7 +1345,19 @@ export const ChatMessageList = forwardRef<VirtuosoHandle, ChatMessageListProps>(
 
     if (isTestEnv) {
       return (
-        <div className="flex-1 overflow-hidden relative" data-testid="integrated-chat-messages">
+        <div
+          ref={transcriptRootRef}
+          className="flex-1 overflow-hidden relative"
+          data-testid="integrated-chat-messages"
+        >
+          {shouldShowInitialPaintCover && (
+            <ConversationTranscriptPlaceholders
+              contentWidthClassName={contentWidthClassName}
+              className="absolute inset-0 z-10 bg-[var(--bg-primary)]"
+              testId="chat-transcript-settling-placeholders"
+              ariaHidden
+            />
+          )}
           {isFilteredTabEmpty && (
             <div className="flex-1 flex items-center justify-center h-full" data-testid="teammate-tab-empty">
               <span className="text-sm" style={{ color: "var(--text-muted)" }}>
@@ -1151,27 +1460,30 @@ export const ChatMessageList = forwardRef<VirtuosoHandle, ChatMessageListProps>(
               </ContentShell>
             </div>
           )}
-          {/* Scroll-to-bottom button — same position as production branch */}
-          {!isAtBottom && timeline.length > 5 && !scrollToTimestamp && (
-            <div className="absolute bottom-4 left-0 right-0 flex justify-center z-10 pointer-events-none">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={scrollToBottom}
-                className="bg-background/95 backdrop-blur shadow-md hover:bg-accent pointer-events-auto"
-              >
-                <ChevronDown className="h-4 w-4 mr-1" />
-                Scroll to bottom
-              </Button>
-            </div>
-          )}
+          <ScrollToBottomControl
+            visible={shouldShowScrollToBottom}
+            onClick={handleScrollToBottomClick}
+            onWheel={handleScrollToBottomWheel}
+          />
         </div>
       );
     }
 
     return (
       <ToolCallStoreKeyContext.Provider value={contextKey ?? null}>
-      <div className="flex-1 overflow-hidden relative" data-testid="integrated-chat-messages">
+      <div
+        ref={transcriptRootRef}
+        className="flex-1 overflow-hidden relative"
+        data-testid="integrated-chat-messages"
+      >
+        {shouldShowInitialPaintCover && (
+          <ConversationTranscriptPlaceholders
+            contentWidthClassName={contentWidthClassName}
+            className="absolute inset-0 z-10 bg-[var(--bg-primary)]"
+            testId="chat-transcript-settling-placeholders"
+            ariaHidden
+          />
+        )}
         {isFilteredTabEmpty && (
           <div className="absolute inset-0 flex items-center justify-center" data-testid="teammate-tab-empty">
             <span className="text-sm" style={{ color: "var(--text-muted)" }}>
@@ -1190,8 +1502,9 @@ export const ChatMessageList = forwardRef<VirtuosoHandle, ChatMessageListProps>(
           // Start at the last item on mount
           initialTopMostItemIndex={timeline.length > 0 ? lastItemIndex : 0}
           followOutput={handleFollowOutput}
-          atBottomStateChange={handleAtBottomStateChange}
+          atBottomStateChange={handleVirtuosoAtBottomStateChange}
           atBottomThreshold={AT_BOTTOM_THRESHOLD}
+          rangeChanged={handleRangeChanged}
           {...(startReachedHandler
             ? { startReached: startReachedHandler }
             : {})}
@@ -1214,21 +1527,12 @@ export const ChatMessageList = forwardRef<VirtuosoHandle, ChatMessageListProps>(
             </span>
           </div>
         )}
-        {/* Scroll-to-bottom button — OUTSIDE Virtuoso to avoid Footer feedback loop.
-            isAtBottom/scrollToBottom/timeline.length are NOT in virtuosoComponents deps. */}
-        {!isAtBottom && timeline.length > 5 && !scrollToTimestamp && (
-          <div className="absolute bottom-4 left-0 right-0 flex justify-center z-10 pointer-events-none">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={scrollToBottom}
-              className="bg-background/95 backdrop-blur shadow-md hover:bg-accent pointer-events-auto"
-            >
-              <ChevronDown className="h-4 w-4 mr-1" />
-              Scroll to bottom
-            </Button>
-          </div>
-        )}
+        {/* Kept outside Virtuoso and always mounted so visibility changes do not rebuild the transcript. */}
+        <ScrollToBottomControl
+          visible={shouldShowScrollToBottom}
+          onClick={handleScrollToBottomClick}
+          onWheel={handleScrollToBottomWheel}
+        />
       </div>
       </ToolCallStoreKeyContext.Provider>
     );

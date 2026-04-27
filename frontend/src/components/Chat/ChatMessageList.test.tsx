@@ -9,9 +9,15 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render as rtlRender, screen } from "@testing-library/react";
+import { render as rtlRender, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { AT_BOTTOM_THRESHOLD, TEXT_LENGTH_BUCKET_SIZE, ChatMessageList, type ChatMessageData } from "./ChatMessageList";
+import {
+  AT_BOTTOM_THRESHOLD,
+  TEXT_LENGTH_BUCKET_SIZE,
+  ChatMessageList,
+  type ChatMessageData,
+} from "./ChatMessageList";
+import { isTranscriptRootReadyForReveal } from "./ChatMessageList.readiness";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ToolCall } from "./ToolCallIndicator";
 import type { StreamingContentBlock } from "@/types/streaming-task";
@@ -32,6 +38,9 @@ const mockHandleAtBottomStateChange = vi.fn();
 const mockHandleFollowOutput = vi.fn((atBottom: boolean) =>
   atBottom ? "smooth" as const : false as const
 );
+const mockUseMessageAttachments = vi.hoisted(() =>
+  vi.fn(() => ({ data: new Map() }))
+);
 
 // Capture hook call args to verify virtuosoRef and disabled are passed
 const mockUseChatAutoScroll = vi.fn(() => ({
@@ -51,7 +60,7 @@ vi.mock("@/hooks/useChatAutoScroll", () => ({
 
 // Mock useMessageAttachments — returns empty map by default (no attachments)
 vi.mock("@/hooks/useMessageAttachments", () => ({
-  useMessageAttachments: () => ({ data: new Map() }),
+  useMessageAttachments: (...args: unknown[]) => mockUseMessageAttachments(...args),
 }));
 
 const createMessages = (count: number): ChatMessageData[] => {
@@ -89,6 +98,7 @@ function render(ui: ReactElement) {
 describe("ChatMessageList - Scroll Behavior", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockUseMessageAttachments.mockReturnValue({ data: new Map() });
     mockIsAtBottom = true;
     scrollIntoViewMock.mockClear();
   });
@@ -148,6 +158,75 @@ describe("ChatMessageList - Scroll Behavior", () => {
       );
 
       expect(emptyFooterSpacer).toBeUndefined();
+    });
+
+    it("keeps a visual placeholder cover until the initial transcript paint settles", async () => {
+      const onInitialPaintReady = vi.fn();
+
+      render(
+        <ChatMessageList
+          {...defaultProps}
+          initialPaintCoverKey="conv-1"
+          onInitialPaintReady={onInitialPaintReady}
+        />
+      );
+
+      expect(screen.getByTestId("chat-transcript-settling-placeholders")).toBeInTheDocument();
+      expect(screen.getByText("Message 10")).toBeInTheDocument();
+
+      await waitFor(() =>
+        expect(screen.queryByTestId("chat-transcript-settling-placeholders")).not.toBeInTheDocument()
+      );
+      expect(onInitialPaintReady).toHaveBeenCalledWith("conv-1");
+    });
+
+    it("defers attachment hydration until the initial transcript cover has cleared", async () => {
+      render(
+        <ChatMessageList
+          {...defaultProps}
+          initialPaintCoverKey="conv-1"
+          onInitialPaintReady={vi.fn()}
+        />
+      );
+
+      expect(mockUseMessageAttachments).toHaveBeenLastCalledWith(
+        defaultProps.messages,
+        "conv-1",
+        expect.objectContaining({ enabled: false })
+      );
+
+      await waitFor(() =>
+        expect(mockUseMessageAttachments).toHaveBeenLastCalledWith(
+          defaultProps.messages,
+          "conv-1",
+          expect.objectContaining({ enabled: true })
+        )
+      );
+    });
+
+    it("does not treat the transcript as reveal-ready while the virtualized item list is hidden", () => {
+      const root = document.createElement("div");
+      const list = document.createElement("div");
+      const message = document.createElement("div");
+
+      list.dataset.testid = "virtuoso-item-list";
+      list.style.visibility = "hidden";
+      message.dataset.chatMessageItem = "true";
+      list.appendChild(message);
+      root.appendChild(list);
+      document.body.appendChild(root);
+
+      try {
+        expect(isTranscriptRootReadyForReveal(root)).toBe(false);
+
+        list.style.visibility = "visible";
+        expect(isTranscriptRootReadyForReveal(root)).toBe(true);
+
+        message.remove();
+        expect(isTranscriptRootReadyForReveal(root)).toBe(false);
+      } finally {
+        root.remove();
+      }
     });
   });
 
@@ -354,17 +433,16 @@ describe("ChatMessageList - Scroll Behavior", () => {
 
       render(<ChatMessageList {...defaultProps} messages={createMessages(10)} />);
 
-      // Button should not be visible
-      expect(screen.queryByText(/Scroll to bottom/i)).not.toBeInTheDocument();
+      expect(screen.getByTestId("chat-scroll-to-bottom-control")).toHaveAttribute("aria-hidden", "true");
+      expect(screen.getByTestId("chat-scroll-to-bottom-button")).toBeDisabled();
     });
 
-    it("hides scroll-to-bottom button with ≤5 messages", () => {
+    it("shows scroll-to-bottom button with <=5 messages when scrolled up", () => {
       mockIsAtBottom = false;
 
       render(<ChatMessageList {...defaultProps} messages={createMessages(5)} />);
 
-      // Button should not be visible for short conversations
-      expect(screen.queryByText(/Scroll to bottom/i)).not.toBeInTheDocument();
+      expect(screen.getByText(/Scroll to bottom/i)).toBeInTheDocument();
     });
 
     it("provides scroll-to-bottom functionality via hook", () => {
@@ -496,8 +574,8 @@ describe("ChatMessageList - Scroll Behavior", () => {
         />
       );
 
-      // Button should not show in history mode
-      expect(screen.queryByText(/Scroll to bottom/i)).not.toBeInTheDocument();
+      expect(screen.getByTestId("chat-scroll-to-bottom-control")).toHaveAttribute("aria-hidden", "true");
+      expect(screen.getByTestId("chat-scroll-to-bottom-button")).toBeDisabled();
     });
   });
 
@@ -664,15 +742,77 @@ describe("ChatMessageList - Scroll Behavior", () => {
 
       render(<ChatMessageList {...defaultProps} messages={createMessages(10)} />);
 
-      expect(screen.queryByText(/Scroll to bottom/i)).not.toBeInTheDocument();
+      expect(screen.getByTestId("chat-scroll-to-bottom-control")).toHaveAttribute("aria-hidden", "true");
+      expect(screen.getByTestId("chat-scroll-to-bottom-button")).toBeDisabled();
     });
 
-    it("should hide scroll button with <=5 messages even when scrolled up", () => {
+    it("keeps a stable lightweight scroll button shell mounted while hidden", () => {
+      mockIsAtBottom = true;
+
+      const { rerender } = render(<ChatMessageList {...defaultProps} messages={createMessages(10)} />);
+      const hiddenControl = screen.getByTestId("chat-scroll-to-bottom-control");
+      expect(hiddenControl).toHaveAttribute("aria-hidden", "true");
+
+      mockIsAtBottom = false;
+      rerender(<ChatMessageList {...defaultProps} messages={createMessages(10)} />);
+
+      expect(screen.getByTestId("chat-scroll-to-bottom-control")).toBe(hiddenControl);
+      expect(hiddenControl).toHaveAttribute("aria-hidden", "false");
+    });
+
+    it("does not use backdrop blur on the scroll button", () => {
+      mockIsAtBottom = false;
+
+      render(<ChatMessageList {...defaultProps} messages={createMessages(10)} />);
+
+      const button = screen.getByTestId("chat-scroll-to-bottom-button");
+      expect(button.className).not.toContain("backdrop-blur");
+      expect(button.className).not.toContain("shadow-md");
+    });
+
+    it("uses a compact button with a trailing caret", () => {
+      mockIsAtBottom = false;
+
+      render(<ChatMessageList {...defaultProps} messages={createMessages(10)} />);
+
+      const button = screen.getByTestId("chat-scroll-to-bottom-button");
+      expect(button.className).toContain("h-8");
+      expect(button.className).toContain("text-xs");
+      expect(button.className).toContain("px-3");
+      expect(button.className).toContain("cursor-pointer");
+      expect(button.className).toContain("hover:bg-");
+      expect(button.lastElementChild?.tagName.toLowerCase()).toBe("svg");
+    });
+
+    it("keeps wheel scrolling active when the pointer is over the button", () => {
+      mockIsAtBottom = false;
+
+      render(<ChatMessageList {...defaultProps} messages={createMessages(10)} />);
+
+      const root = screen.getByTestId("integrated-chat-messages");
+      Object.defineProperty(root, "scrollTop", {
+        value: 0,
+        writable: true,
+        configurable: true,
+      });
+
+      const button = screen.getByTestId("chat-scroll-to-bottom-button");
+      const wheelEvent = new WheelEvent("wheel", {
+        bubbles: true,
+        cancelable: true,
+        deltaY: 96,
+      });
+      button.dispatchEvent(wheelEvent);
+
+      expect(root.scrollTop).toBe(96);
+    });
+
+    it("should show scroll button with <=5 messages when scrolled up", () => {
       mockIsAtBottom = false;
 
       render(<ChatMessageList {...defaultProps} messages={createMessages(3)} />);
 
-      expect(screen.queryByText(/Scroll to bottom/i)).not.toBeInTheDocument();
+      expect(screen.getByText(/Scroll to bottom/i)).toBeInTheDocument();
     });
 
     it("should call scrollToBottom when button is clicked", async () => {
@@ -1430,14 +1570,14 @@ describe("ChatMessageList - Scroll Behavior", () => {
   });
 
   describe("scroll-to-bottom on shouldFilterLastAssistant clear — Task #9 fix", () => {
-    // Verifies that scrollToBottom() is called when shouldFilterLastAssistant transitions true→false.
-    // This ensures the finalized assistant message is visible after streaming ends.
+    // Verifies that true-bottom pinning runs when shouldFilterLastAssistant transitions true→false.
+    // This ensures the finalized assistant message metadata/actions are visible after streaming ends.
 
     beforeEach(() => {
       mockScrollToBottom.mockClear();
     });
 
-    it("calls scrollToBottom when active streaming ends (streamingContentBlocks cleared)", () => {
+    it("pins to bottom when active streaming ends (streamingContentBlocks cleared)", async () => {
       const messages: ChatMessageData[] = [
         { id: "msg-1", role: "user", content: "Hello", createdAt: new Date(2026, 0, 1, 12, 0).toISOString(), toolCalls: null, contentBlocks: null },
         { id: "msg-2", role: "assistant", content: "Response", createdAt: new Date(2026, 0, 1, 12, 1).toISOString(), toolCalls: null, contentBlocks: null },
@@ -1465,10 +1605,10 @@ describe("ChatMessageList - Scroll Behavior", () => {
         />
       );
 
-      expect(mockScrollToBottom).toHaveBeenCalledOnce();
+      await waitFor(() => expect(mockScrollToBottom).toHaveBeenCalledOnce());
     });
 
-    it("calls scrollToBottom when isFinalizing transitions from true to false", () => {
+    it("pins to bottom when isFinalizing transitions from true to false", async () => {
       const messages: ChatMessageData[] = [
         { id: "msg-1", role: "user", content: "Hello", createdAt: new Date(2026, 0, 1, 12, 0).toISOString(), toolCalls: null, contentBlocks: null },
         { id: "msg-2", role: "assistant", content: "Response", createdAt: new Date(2026, 0, 1, 12, 1).toISOString(), toolCalls: null, contentBlocks: null },
@@ -1496,7 +1636,7 @@ describe("ChatMessageList - Scroll Behavior", () => {
         />
       );
 
-      expect(mockScrollToBottom).toHaveBeenCalledOnce();
+      await waitFor(() => expect(mockScrollToBottom).toHaveBeenCalledOnce());
     });
 
     it("does NOT call scrollToBottom when filter stays false across renders", () => {

@@ -1,7 +1,7 @@
 /**
  * IntegratedChatPanel - Context-aware chat panel for split-screen layout
  *
- * This is a refactored version of ChatPanel that:
+ * This is the shared embedded chat surface that:
  * - Is part of the layout, not fixed positioned
  * - Supports context switching based on selected task
  * - No slide animations (instant show/hide)
@@ -13,7 +13,6 @@ import { useState, useRef, useEffect, useLayoutEffect, useMemo, useCallback } fr
 import { type VirtuosoHandle } from "react-virtuoso";
 import {
   useChat,
-  useConversation,
   useConversationHistoryWindow,
   chatKeys,
 } from "@/hooks/useChat";
@@ -54,6 +53,7 @@ import {
   PreviousRunBanner,
   animationStyles,
   HistoryEmptyState,
+  ConversationTranscriptPlaceholders,
 } from "./IntegratedChatPanel.components";
 import { useChatActions } from "@/hooks/useChatActions";
 import { useChatEvents } from "@/hooks/useChatEvents";
@@ -91,6 +91,7 @@ import { cn } from "@/lib/utils";
 
 // Stable empty array to avoid new reference on every render when tasks query returns undefined
 const EMPTY_TASKS: never[] = [];
+const EMPTY_SORTED_MESSAGES: never[] = [];
 
 // ============================================================================
 // Main Component
@@ -195,6 +196,11 @@ export function IntegratedChatPanel({
   const bus = useEventBus();
   const queryClient = useQueryClient();
   const pollStartRef = useRef<number | null>(null);
+  const transcriptHydrationJobRef = useRef<{ frame: number | null; timer: number | null } | null>(null);
+  const [hydratedTranscriptConversationId, setHydratedTranscriptConversationId] =
+    useState<string | null>(null);
+  const [transcriptPaintCoverConversationId, setTranscriptPaintCoverConversationId] =
+    useState<string | null>(null);
   const [childSessionModalId, setChildSessionModalId] = useState<string | null>(null);
   const ideationSessionsById = useIdeationStore((s) => s.sessions);
   const globalSelectedTaskId = useUiStore((s) => s.selectedTaskId);
@@ -206,7 +212,9 @@ export function IntegratedChatPanel({
   const hasHistoryConversation = !!taskHistoryState?.conversationId;
 
   // Get task data from React Query (useTasks) which has full task data
-  const { data: tasks = EMPTY_TASKS } = useTasks(projectId);
+  const { data: tasks = EMPTY_TASKS } = useTasks(projectId, {
+    enabled: Boolean(selectedTaskId),
+  });
 
   // Read from Zustand store (event-updated, sync) — same pattern as TaskDetailOverlay
   const taskFromStore = useTaskStore((state) =>
@@ -515,7 +523,7 @@ export function IntegratedChatPanel({
     isVisible,
     storeKey: storeContextKey,
     disableAutoSelect: true,
-    skipActiveConversationQuery: !!ideationSessionId,
+    skipActiveConversationQuery: true,
     ...(sendOptions !== undefined ? { sendOptions } : {}),
   });
 
@@ -571,26 +579,32 @@ export function IntegratedChatPanel({
   }, [autoSelectConversation, conversationsData, conversationsLoading, isVisible]);
 
   const {
-    messages: activeConversation,
     sendMessage,
     switchConversation: handleSelectConversation,
     createConversation: handleNewConversation,
   } = regularChatData;
 
-  // Load teammate conversation messages when on a teammate tab
-  const teammateConversation = useConversation(teammateConversationId);
-  const ideationConversationHistory = useConversationHistoryWindow(
-    ideationSessionId && !isTeammateTab ? activeConversationId : null,
+  // Load active transcript windows through the shared tail-window query. The
+  // backend returns each newest window oldest-to-newest; older pages prepend.
+  const teammateConversationHistory = useConversationHistoryWindow(
+    isTeammateTab ? teammateConversationId : null,
     {
-      enabled: !!ideationSessionId && !isTeammateTab,
+      enabled: !!teammateConversationId && isTeammateTab,
+      pageSize: 40,
+    }
+  );
+  const primaryConversationHistory = useConversationHistoryWindow(
+    !isTeammateTab ? activeConversationId : null,
+    {
+      enabled: !!activeConversationId && !isTeammateTab,
       pageSize: 40,
     }
   );
 
   const primaryConversationData =
-    ideationSessionId && !isTeammateTab
-      ? ideationConversationHistory.data
-      : activeConversation.data;
+    !isTeammateTab
+      ? primaryConversationHistory.data ?? regularChatData.messages.data
+      : regularChatData.messages.data;
   const currentPrimaryConversationData =
     activeConversationId &&
     primaryConversationData &&
@@ -600,10 +614,10 @@ export function IntegratedChatPanel({
       : null;
   const currentTeammateConversationData =
     teammateConversationId &&
-    teammateConversation.data &&
-    (!teammateConversation.data.conversation?.id ||
-      teammateConversation.data.conversation.id === teammateConversationId)
-      ? teammateConversation.data
+    teammateConversationHistory.data &&
+    (!teammateConversationHistory.data.conversation?.id ||
+      teammateConversationHistory.data.conversation.id === teammateConversationId)
+      ? teammateConversationHistory.data
       : null;
 
   // Check if active conversation belongs to current context (needed by recovery effects below)
@@ -718,6 +732,86 @@ export function IntegratedChatPanel({
       currentPrimaryConversationData,
     ]
   );
+
+  // Loading state: show skeleton when conversations list is loading OR active conversation is loading
+  const isConversationsLoading = conversations.isLoading;
+  const isActiveConversationLoading = activeConversationId
+    ? isTeammateTab
+      ? teammateConversationHistory.isLoading && !currentTeammateConversationData
+      : primaryConversationHistory.isLoading && !primaryConversationData
+    : false;
+  const isLoading = isConversationsLoading || isActiveConversationLoading;
+  const transcriptConversationId = effectiveConversationId ?? activeConversationId ?? null;
+  const hasTranscriptMessages = messagesData.length > 0;
+  const shouldDeferTranscriptHydration =
+    Boolean(transcriptConversationId) &&
+    !isLoading &&
+    hasTranscriptMessages &&
+    hydratedTranscriptConversationId !== transcriptConversationId;
+
+  useEffect(() => {
+    const clearHydrationJob = () => {
+      const job = transcriptHydrationJobRef.current;
+      if (!job) {
+        return;
+      }
+      if (job.frame !== null) {
+        window.cancelAnimationFrame(job.frame);
+      }
+      if (job.timer !== null) {
+        window.clearTimeout(job.timer);
+      }
+      transcriptHydrationJobRef.current = null;
+    };
+
+    clearHydrationJob();
+
+    if (!transcriptConversationId || isLoading) {
+      return clearHydrationJob;
+    }
+
+    if (!hasTranscriptMessages) {
+      if (hydratedTranscriptConversationId !== transcriptConversationId) {
+        setHydratedTranscriptConversationId(transcriptConversationId);
+      }
+      return clearHydrationJob;
+    }
+
+    if (hydratedTranscriptConversationId === transcriptConversationId) {
+      return clearHydrationJob;
+    }
+
+    const job = { frame: null as number | null, timer: null as number | null };
+    const hydrate = () => {
+      job.timer = null;
+      transcriptHydrationJobRef.current = null;
+      setTranscriptPaintCoverConversationId(transcriptConversationId);
+      setHydratedTranscriptConversationId(transcriptConversationId);
+    };
+
+    if (typeof window.requestAnimationFrame === "function") {
+      job.frame = window.requestAnimationFrame(() => {
+        job.frame = null;
+        job.timer = window.setTimeout(hydrate, 0);
+      });
+    } else {
+      job.timer = window.setTimeout(hydrate, 0);
+    }
+
+    transcriptHydrationJobRef.current = job;
+    return clearHydrationJob;
+  }, [
+    hasTranscriptMessages,
+    hydratedTranscriptConversationId,
+    isLoading,
+    transcriptConversationId,
+  ]);
+
+  const handleTranscriptInitialPaintReady = useCallback((conversationId: string) => {
+    setTranscriptPaintCoverConversationId((current) =>
+      current === conversationId ? null : current,
+    );
+  }, []);
 
   // Debug logging for history mode
   logger.debug('[IntegratedChatPanel] Context mode:', {
@@ -877,6 +971,10 @@ export function IntegratedChatPanel({
   // Sort messages by createdAt always. Secondary sort by id provides stable
   // tiebreaking when timestamps are equal (e.g. optimistic + DB messages share ms).
   const sortedMessages = useMemo(() => {
+    if (shouldDeferTranscriptHydration) {
+      return EMPTY_SORTED_MESSAGES;
+    }
+
     return [...messagesData]
       // Hide session recovery rehydration prompts from UI.
       // Primary: metadata flag set by backend. Fallback: content prefix for pre-existing rows.
@@ -895,16 +993,7 @@ export function IntegratedChatPanel({
         if (timeDiff !== 0) return timeDiff;
         return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
       });
-  }, [messagesData]);
-
-  // Loading state: show skeleton when conversations list is loading OR active conversation is loading
-  const isConversationsLoading = conversations.isLoading;
-  const isActiveConversationLoading = activeConversationId
-    ? ideationSessionId && !isTeammateTab
-      ? ideationConversationHistory.isLoading
-      : activeConversation.isLoading
-    : false;
-  const isLoading = isConversationsLoading || isActiveConversationLoading;
+  }, [messagesData, shouldDeferTranscriptHydration]);
 
   // Status badge helpers - disabled in history mode (no live agent)
   // isAgentActive: only true when actively generating (not waiting_for_input)
@@ -963,7 +1052,8 @@ export function IntegratedChatPanel({
             WebkitBackdropFilter: "blur(20px) saturate(180%)",
           }}
         >
-          {/* Header — theme-agnostic subtle tint matches ChatPanel overlay.
+          {/* Header — theme-agnostic subtle tint keeps the embedded chrome
+             aligned across themes.
              Previous bg-base@50 produced visible seam on Dark (lum=25 vs
              body lum=30) and collapsed to pure black on HC. Using a tint
              derived from text-primary keeps a consistent 2% brighter band
@@ -1076,6 +1166,10 @@ export function IntegratedChatPanel({
             <div className="flex-1 flex items-center justify-center" data-testid="integrated-chat-messages">
               <LoadingState />
             </div>
+          ) : shouldDeferTranscriptHydration ? (
+            <ConversationTranscriptPlaceholders
+              contentWidthClassName={contentWidthClassName}
+            />
           ) : isEmpty ? (
             <div className="flex-1 flex items-center justify-center" data-testid="integrated-chat-messages">
               {emptyState ??
@@ -1090,10 +1184,16 @@ export function IntegratedChatPanel({
               ref={virtuosoRef}
               messages={sortedMessages}
               conversationId={effectiveConversationId}
+              initialPaintCoverKey={
+                transcriptPaintCoverConversationId === transcriptConversationId
+                  ? transcriptPaintCoverConversationId
+                  : null
+              }
+              onInitialPaintReady={handleTranscriptInitialPaintReady}
               firstItemIndex={
-                ideationSessionId && !isTeammateTab
-                  ? ideationConversationHistory.loadedStartIndex
-                  : 0
+                isTeammateTab
+                  ? teammateConversationHistory.loadedStartIndex
+                  : primaryConversationHistory.loadedStartIndex
               }
               failedRun={failedRunProp}
               onDismissFailedRun={setDismissedErrorId}
@@ -1110,19 +1210,19 @@ export function IntegratedChatPanel({
               providerSessionId={activeConversationMeta?.providerSessionId ?? null}
               contentWidthClassName={contentWidthClassName}
               hasOlderMessages={
-                !!ideationSessionId &&
-                !isTeammateTab &&
-                ideationConversationHistory.hasOlderMessages
+                isTeammateTab
+                  ? teammateConversationHistory.hasOlderMessages
+                  : primaryConversationHistory.hasOlderMessages
               }
               isFetchingOlderMessages={
-                !!ideationSessionId &&
-                !isTeammateTab &&
-                ideationConversationHistory.isFetchingOlderMessages
+                isTeammateTab
+                  ? teammateConversationHistory.isFetchingOlderMessages
+                  : primaryConversationHistory.isFetchingOlderMessages
               }
               onLoadOlderMessages={
-                ideationSessionId && !isTeammateTab
-                  ? ideationConversationHistory.fetchOlderMessages
-                  : undefined
+                isTeammateTab
+                  ? teammateConversationHistory.fetchOlderMessages
+                  : primaryConversationHistory.fetchOlderMessages
               }
             />
           )}

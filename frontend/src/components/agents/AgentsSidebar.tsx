@@ -26,7 +26,7 @@ import {
   X,
   XCircle,
 } from "lucide-react";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -61,6 +61,7 @@ import { withAlpha } from "@/lib/theme-colors";
 import type { Project } from "@/types/project";
 import {
   formatAgentConversationCreatedAt,
+  formatAgentConversationCreatedAtTitle,
   getAgentConversationStoreKey,
   type AgentConversation,
 } from "./agentConversations";
@@ -72,11 +73,13 @@ const PROJECT_SORT_LABELS: Record<AgentProjectSort, string> = {
   az: "A-Z",
   za: "Z-A",
 };
+const AGENTS_SEARCH_DEBOUNCE_MS = 180;
 
 interface AgentsSidebarProps {
   projects: Project[];
   focusedProjectId: string | null;
   selectedConversationId: string | null;
+  pinnedConversation?: AgentConversation | null;
   onFocusProject: (projectId: string) => void;
   onSelectConversation: (projectId: string, conversation: AgentConversation) => void;
   onCreateAgent: () => void;
@@ -94,6 +97,7 @@ export function AgentsSidebar({
   projects,
   focusedProjectId,
   selectedConversationId,
+  pinnedConversation = null,
   onFocusProject,
   onSelectConversation,
   onCreateAgent,
@@ -112,10 +116,40 @@ export function AgentsSidebar({
   const projectSort = useAgentSessionStore((s) => s.projectSort);
   const setShowAllProjects = useAgentSessionStore((s) => s.setShowAllProjects);
   const setProjectSort = useAgentSessionStore((s) => s.setProjectSort);
-  const normalizedSearch = searchQuery.trim().toLowerCase();
-  const { totalArchivedCount } = useArchivedConversationCounts(
-    projects.map((project) => project.id)
+  const normalizedSearchInput = searchQuery.trim().toLowerCase();
+  const normalizedSearch = useDebouncedValue(
+    normalizedSearchInput,
+    AGENTS_SEARCH_DEBOUNCE_MS
   );
+  const pinnedProjectId = pinnedConversation?.projectId ?? null;
+  const shouldHydrateAllSidebarProjects =
+    showAllProjects || showArchived || normalizedSearch.length > 0;
+  const archivedCountProjectIds = useMemo(() => {
+    if (shouldHydrateAllSidebarProjects) {
+      return projects.map((project) => project.id);
+    }
+
+    const projectIds = new Set<string>();
+    if (focusedProjectId) {
+      projectIds.add(focusedProjectId);
+    }
+    if (pinnedProjectId) {
+      projectIds.add(pinnedProjectId);
+    }
+    if (projectIds.size === 0 && projects[0]) {
+      projectIds.add(projects[0].id);
+    }
+
+    return projects
+      .filter((project) => projectIds.has(project.id))
+      .map((project) => project.id);
+  }, [
+    focusedProjectId,
+    pinnedProjectId,
+    projects,
+    shouldHydrateAllSidebarProjects,
+  ]);
+  const { totalArchivedCount } = useArchivedConversationCounts(archivedCountProjectIds);
   const orderedProjects = useMemo(() => {
     if (projectSort === "latest") {
       return projects;
@@ -362,6 +396,9 @@ export function AgentsSidebar({
               project={project}
               isFocused={focusedProjectId === project.id}
               selectedConversationId={selectedConversationId}
+              pinnedConversation={
+                pinnedConversation?.projectId === project.id ? pinnedConversation : null
+              }
               searchQuery={normalizedSearch}
               onFocusProject={onFocusProject}
               onSelectConversation={onSelectConversation}
@@ -403,6 +440,7 @@ interface ProjectSessionGroupProps {
   project: Project;
   isFocused: boolean;
   selectedConversationId: string | null;
+  pinnedConversation: AgentConversation | null;
   searchQuery: string;
   onFocusProject: (projectId: string) => void;
   onSelectConversation: (projectId: string, conversation: AgentConversation) => void;
@@ -418,6 +456,7 @@ function ProjectSessionGroup({
   project,
   isFocused,
   selectedConversationId,
+  pinnedConversation,
   searchQuery,
   onFocusProject,
   onSelectConversation,
@@ -438,16 +477,28 @@ function ProjectSessionGroup({
     useState<AgentConversation | null>(null);
   const expanded = useAgentSessionStore((s) => s.expandedProjectIds[project.id] ?? true);
   const toggleProjectExpanded = useAgentSessionStore((s) => s.toggleProjectExpanded);
+  const shouldEnableConversationQuery =
+    showAllProjects ||
+    showArchived ||
+    isFocused ||
+    Boolean(pinnedConversation) ||
+    searchQuery.length > 0;
   const conversations = useProjectAgentConversations(project.id, showArchived, {
     search: searchQuery,
+    enabled: shouldEnableConversationQuery,
   });
   const activeConversationIds = useChatStore((s) => s.activeConversationIds);
   const agentStatuses = useChatStore((s) => s.agentStatus);
-  const projectMatchesSearch = project.name.toLowerCase().includes(searchQuery);
-  const visibleConversations = useMemo(
-    () => conversations.data ?? [],
-    [conversations.data]
-  );
+  const visibleConversations = useMemo(() => {
+    const items = conversations.data ?? [];
+    if (
+      !pinnedConversation ||
+      items.some((conversation) => conversation.id === pinnedConversation.id)
+    ) {
+      return items;
+    }
+    return [pinnedConversation, ...items];
+  }, [conversations.data, pinnedConversation]);
   const totalConversationCount = conversations.total;
   const activeRuntimeCount = visibleConversations.filter((conversation) => {
     const rowKey = getAgentConversationStoreKey(conversation);
@@ -477,7 +528,8 @@ function ProjectSessionGroup({
     !conversations.isLoading &&
     visibleConversations.length === 0 &&
     (showArchived ||
-      (searchQuery ? !projectMatchesSearch || !showAllProjects : !showAllProjects))
+      searchQuery.length > 0 ||
+      !showAllProjects)
   ) {
     return null;
   }
@@ -705,6 +757,7 @@ function ProjectSessionGroup({
                   const isActiveRuntime = activeConversationId === conversation.id;
                   const title = conversation.title || "Untitled agent";
                   const createdLabel = formatAgentConversationCreatedAt(conversation.createdAt);
+                  const createdTitle = formatAgentConversationCreatedAtTitle(conversation.createdAt);
                   const statusLabel = conversation.archivedAt
                     ? `Archived * ${createdLabel}`
                     : createdLabel;
@@ -749,6 +802,7 @@ function ProjectSessionGroup({
                               </span>
                               <span
                                 className="shrink-0 text-[10px]"
+                                title={createdTitle || undefined}
                                 style={{ color: "var(--text-muted)" }}
                               >
                                 {statusLabel}
@@ -833,6 +887,17 @@ function ProjectSessionGroup({
       </div>
     </div>
   );
+}
+
+function useDebouncedValue<T>(value: T, delayMs: number): T {
+  const [debouncedValue, setDebouncedValue] = useState(value);
+
+  useEffect(() => {
+    const timeout = window.setTimeout(() => setDebouncedValue(value), delayMs);
+    return () => window.clearTimeout(timeout);
+  }, [delayMs, value]);
+
+  return debouncedValue;
 }
 
 function SessionStateGlyph({

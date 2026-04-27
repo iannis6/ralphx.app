@@ -1,18 +1,20 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from "react";
+import { createPortal } from "react-dom";
 import { listen } from "@tauri-apps/api/event";
-import { FitAddon } from "@xterm/addon-fit";
-import {
+import type { FitAddon } from "@xterm/addon-fit";
+import type {
   Terminal as XTermTerminal,
-  type IDisposable,
-  type ITheme,
+  IDisposable,
+  ITheme,
 } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import {
@@ -45,6 +47,9 @@ import {
 } from "@/components/ui/tooltip";
 import { formatBranchDisplay } from "@/lib/branch-utils";
 import { cn } from "@/lib/utils";
+import { compactTerminalPath } from "./agentTerminalPaths";
+import { loadAgentTerminalRuntime } from "./agentTerminalRuntime";
+import type { AgentTerminalPlacement } from "./agentTerminalStore";
 
 interface AgentTerminalDrawerProps {
   conversationId: string;
@@ -52,10 +57,42 @@ interface AgentTerminalDrawerProps {
   height: number;
   onHeightChange: (height: number) => void;
   onClose: () => void;
+  placement: AgentTerminalPlacement;
+  onPlacementChange: (placement: AgentTerminalPlacement) => void;
+  dockElement: HTMLElement | null;
 }
 
 const TERMINAL_MIN_COLS = 80;
 const TERMINAL_MIN_ROWS = 20;
+
+type DeferredFrameJob = { frame: number | null; timer: number | null };
+
+function cancelDeferredFrameJob(job: DeferredFrameJob | null) {
+  if (!job) {
+    return;
+  }
+  if (job.frame !== null) {
+    window.cancelAnimationFrame(job.frame);
+  }
+  if (job.timer !== null) {
+    window.clearTimeout(job.timer);
+  }
+}
+
+function scheduleDeferredFrameJob(callback: () => void): DeferredFrameJob {
+  const job: DeferredFrameJob = {
+    frame: null,
+    timer: null,
+  };
+  job.frame = window.requestAnimationFrame(() => {
+    job.frame = null;
+    job.timer = window.setTimeout(() => {
+      job.timer = null;
+      callback();
+    }, 0);
+  });
+  return job;
+}
 
 export function AgentTerminalDrawer({
   conversationId,
@@ -63,14 +100,26 @@ export function AgentTerminalDrawer({
   height,
   onHeightChange,
   onClose,
+  placement,
+  onPlacementChange,
+  dockElement,
 }: AgentTerminalDrawerProps) {
   const terminalId = DEFAULT_AGENT_TERMINAL_ID;
+  const [portalRoot] = useState(() => {
+    const element = document.createElement("div");
+    element.style.width = "100%";
+    return element;
+  });
+  const [hasDocked, setHasDocked] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<XTermTerminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
+  const dockMoveJobRef = useRef<DeferredFrameJob | null>(null);
   const hydrationCompleteRef = useRef(false);
   const bufferedEventsRef = useRef<AgentTerminalEvent[]>([]);
   const lastAppliedEventKeyRef = useRef<string | null>(null);
+  const lastReportedSizeRef = useRef<{ cols: number; rows: number } | null>(null);
+  const resizeReportTimerRef = useRef<number | null>(null);
   const writeQueueRef = useRef<Promise<void>>(Promise.resolve());
   const [status, setStatus] = useState<AgentTerminalStatus>("running");
   const [cwd, setCwd] = useState(workspace.worktreePath);
@@ -78,35 +127,110 @@ export function AgentTerminalDrawer({
   const [isFocused, setIsFocused] = useState(false);
   const [isRestarting, setIsRestarting] = useState(false);
   const [isClearing, setIsClearing] = useState(false);
+  const [isHydrating, setIsHydrating] = useState(true);
 
   const branchLabel = useMemo(
     () => formatBranchDisplay(branchName).short,
     [branchName],
   );
+  const displayCwd = useMemo(() => compactTerminalPath(cwd), [cwd]);
 
   const terminalTheme = useMemo(() => readTerminalTheme(), []);
 
-  const fitAndReportSize = useCallback(() => {
+  const fitTerminal = useCallback(() => {
     const terminal = terminalRef.current;
     const fitAddon = fitAddonRef.current;
     if (!terminal || !fitAddon || !containerRef.current) {
-      return;
+      return null;
     }
 
     try {
       fitAddon.fit();
-      const cols = Math.max(terminal.cols || 0, TERMINAL_MIN_COLS);
-      const rows = Math.max(terminal.rows || 0, TERMINAL_MIN_ROWS);
+      return {
+        cols: Math.max(terminal.cols || 0, TERMINAL_MIN_COLS),
+        rows: Math.max(terminal.rows || 0, TERMINAL_MIN_ROWS),
+      };
+    } catch {
+      // xterm can throw when fitting while detached during fast route switches.
+      return null;
+    }
+  }, []);
+
+  const fitAndReportSize = useCallback(() => {
+    const size = fitTerminal();
+    if (!size) {
+      return;
+    }
+    const lastReported = lastReportedSizeRef.current;
+    if (
+      lastReported &&
+      lastReported.cols === size.cols &&
+      lastReported.rows === size.rows
+    ) {
+      return;
+    }
+    lastReportedSizeRef.current = size;
+
+    if (resizeReportTimerRef.current !== null) {
+      window.clearTimeout(resizeReportTimerRef.current);
+    }
+    resizeReportTimerRef.current = window.setTimeout(() => {
+      resizeReportTimerRef.current = null;
       void resizeAgentTerminal({
         conversationId,
         terminalId,
-        cols,
-        rows,
+        cols: size.cols,
+        rows: size.rows,
       }).catch(() => undefined);
-    } catch {
-      // xterm can throw when fitting while detached during fast route switches.
+    }, 80);
+  }, [conversationId, fitTerminal, terminalId]);
+
+  const cancelDockMove = useCallback(() => {
+    cancelDeferredFrameJob(dockMoveJobRef.current);
+    dockMoveJobRef.current = null;
+  }, []);
+
+  useEffect(
+    () => () => {
+      cancelDockMove();
+      portalRoot.remove();
+    },
+    [cancelDockMove, portalRoot],
+  );
+
+  useLayoutEffect(() => {
+    if (!dockElement) {
+      return;
     }
-  }, [conversationId, terminalId]);
+
+    cancelDockMove();
+    const currentDock = portalRoot.parentElement;
+    if (currentDock === dockElement) {
+      if (!hasDocked) {
+        setHasDocked(true);
+      }
+      return;
+    }
+
+    if (!currentDock) {
+      dockElement.appendChild(portalRoot);
+      if (!hasDocked) {
+        setHasDocked(true);
+      }
+      return;
+    }
+
+    portalRoot.parentElement?.removeChild(portalRoot);
+    dockElement.appendChild(portalRoot);
+    if (!hasDocked) {
+      setHasDocked(true);
+    }
+
+    dockMoveJobRef.current = scheduleDeferredFrameJob(() => {
+      dockMoveJobRef.current = null;
+      fitAndReportSize();
+    });
+  }, [cancelDockMove, dockElement, fitAndReportSize, hasDocked, portalRoot]);
 
   const applySnapshot = useCallback((snapshot: AgentTerminalSnapshot) => {
     setStatus(snapshot.status);
@@ -184,6 +308,9 @@ export function AgentTerminalDrawer({
   }, []);
 
   useEffect(() => {
+    if (!hasDocked) {
+      return;
+    }
     const host = containerRef.current;
     if (!host) {
       return;
@@ -191,28 +318,14 @@ export function AgentTerminalDrawer({
 
     hydrationCompleteRef.current = false;
     bufferedEventsRef.current = [];
-
-    const terminal = new XTermTerminal({
-      allowProposedApi: false,
-      convertEol: true,
-      cursorBlink: true,
-      cursorStyle: "block",
-      fontFamily:
-        "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace",
-      fontSize: 12,
-      lineHeight: 1.18,
-      scrollback: 5_000,
-      theme: terminalTheme,
-    });
-    const fitAddon = new FitAddon();
-    terminal.loadAddon(fitAddon);
-    terminal.open(host);
-    terminalRef.current = terminal;
-    fitAddonRef.current = fitAddon;
+    setIsHydrating(true);
 
     let disposed = false;
+    let terminal: XTermTerminal | null = null;
     let dataDisposable: IDisposable | null = null;
     let resizeFrame: number | null = null;
+    let initFrame: number | null = null;
+    let initTimer: number | null = null;
     let resizeObserver: ResizeObserver | null = null;
     let unlisten: (() => void) | null = null;
     let listenerPromise: Promise<void> | null = null;
@@ -235,6 +348,30 @@ export function AgentTerminalDrawer({
     };
 
     const start = async () => {
+      const { Terminal, FitAddon } = await loadAgentTerminalRuntime();
+      if (disposed) {
+        return;
+      }
+
+      terminal = new Terminal({
+        allowProposedApi: false,
+        convertEol: true,
+        cursorBlink: true,
+        cursorStyle: "block",
+        fontFamily:
+          "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace",
+        fontSize: 12,
+        lineHeight: 1.18,
+        scrollback: 5_000,
+        theme: terminalTheme,
+      });
+      const fitAddon = new FitAddon();
+      terminal.loadAddon(fitAddon);
+      terminal.open(host);
+      terminalRef.current = terminal;
+      fitAddonRef.current = fitAddon;
+      setIsHydrating(false);
+
       listenerPromise = listen<unknown>(AGENT_TERMINAL_EVENT, (event) => {
         const parsed = AgentTerminalEventSchema.safeParse(event.payload);
         if (parsed.success) {
@@ -253,14 +390,16 @@ export function AgentTerminalDrawer({
         return;
       }
 
-      scheduleFit();
-      const cols = Math.max(terminal.cols || 0, TERMINAL_MIN_COLS);
-      const rows = Math.max(terminal.rows || 0, TERMINAL_MIN_ROWS);
+      const initialSize = fitTerminal() ?? {
+        cols: TERMINAL_MIN_COLS,
+        rows: TERMINAL_MIN_ROWS,
+      };
+      lastReportedSizeRef.current = initialSize;
       const snapshot = await openAgentTerminal({
         conversationId,
         terminalId,
-        cols,
-        rows,
+        cols: initialSize.cols,
+        rows: initialSize.rows,
       });
 
       if (disposed) {
@@ -298,26 +437,43 @@ export function AgentTerminalDrawer({
       terminal.focus();
     };
 
-    void start().catch((error) => {
-      if (disposed) {
-        return;
-      }
-      setStatus("error");
-      const message = error instanceof Error ? error.message : "Failed to open terminal";
-      terminal.write(`\r\n[terminal error] ${message}\r\n`);
+    initFrame = window.requestAnimationFrame(() => {
+      initFrame = null;
+      initTimer = window.setTimeout(() => {
+        initTimer = null;
+        void start().catch((error) => {
+          if (disposed) {
+            return;
+          }
+          setIsHydrating(false);
+          setStatus("error");
+          const message = error instanceof Error ? error.message : "Failed to open terminal";
+          terminalRef.current?.write(`\r\n[terminal error] ${message}\r\n`);
+        });
+      }, 0);
     });
 
     return () => {
       disposed = true;
       hydrationCompleteRef.current = false;
+      if (initFrame !== null) {
+        window.cancelAnimationFrame(initFrame);
+      }
+      if (initTimer !== null) {
+        window.clearTimeout(initTimer);
+      }
       if (resizeFrame !== null) {
         window.cancelAnimationFrame(resizeFrame);
+      }
+      if (resizeReportTimerRef.current !== null) {
+        window.clearTimeout(resizeReportTimerRef.current);
+        resizeReportTimerRef.current = null;
       }
       resizeObserver?.disconnect();
       dataDisposable?.dispose();
       releaseListener();
       void listenerPromise?.then(releaseListener);
-      terminal.dispose();
+      terminal?.dispose();
       terminalRef.current = null;
       fitAddonRef.current = null;
     };
@@ -325,13 +481,26 @@ export function AgentTerminalDrawer({
     applyEvent,
     applySnapshot,
     conversationId,
+    fitTerminal,
     fitAndReportSize,
+    hasDocked,
     showControlError,
     terminalId,
     terminalTheme,
   ]);
 
+  const hasTerminalInstance = useCallback(() => {
+    if (!terminalRef.current) {
+      setStatus("error");
+      return false;
+    }
+    return true;
+  }, []);
+
   const handleClear = useCallback(async () => {
+    if (!hasTerminalInstance()) {
+      return;
+    }
     setIsClearing(true);
     try {
       const snapshot = await clearAgentTerminal({
@@ -346,15 +515,24 @@ export function AgentTerminalDrawer({
     } finally {
       setIsClearing(false);
     }
-  }, [applySnapshot, conversationId, showControlError, terminalId]);
+  }, [
+    applySnapshot,
+    conversationId,
+    hasTerminalInstance,
+    showControlError,
+    terminalId,
+  ]);
 
   const handleRestart = useCallback(async () => {
     const terminal = terminalRef.current;
+    if (!terminal) {
+      return;
+    }
     setIsRestarting(true);
     try {
-      terminal?.reset();
-      const cols = Math.max(terminal?.cols || 0, TERMINAL_MIN_COLS);
-      const rows = Math.max(terminal?.rows || 0, TERMINAL_MIN_ROWS);
+      terminal.reset();
+      const cols = Math.max(terminal.cols || 0, TERMINAL_MIN_COLS);
+      const rows = Math.max(terminal.rows || 0, TERMINAL_MIN_ROWS);
       const snapshot = await restartAgentTerminal({
         conversationId,
         terminalId,
@@ -370,10 +548,9 @@ export function AgentTerminalDrawer({
   }, [applySnapshot, conversationId, showControlError, terminalId]);
 
   const handleClose = useCallback(() => {
-    void closeAgentTerminal({ conversationId, terminalId })
-      .catch(showControlError)
-      .finally(onClose);
-  }, [conversationId, onClose, showControlError, terminalId]);
+    onClose();
+    void closeAgentTerminal({ conversationId, terminalId }).catch(() => undefined);
+  }, [conversationId, onClose, terminalId]);
 
   const handleResizeStart = useCallback(
     (event: ReactMouseEvent<HTMLButtonElement>) => {
@@ -395,7 +572,11 @@ export function AgentTerminalDrawer({
     [height, onHeightChange],
   );
 
-  return (
+  if (!hasDocked) {
+    return null;
+  }
+
+  return createPortal(
     <div
       className={cn(
         "relative shrink-0 overflow-hidden border-t",
@@ -435,25 +616,35 @@ export function AgentTerminalDrawer({
           </span>
           <span className="h-1 w-1 rounded-full" style={{ background: "var(--text-muted)" }} />
           <span className="shrink-0 capitalize" style={{ color: "var(--text-secondary)" }}>
-            {status}
+            {isHydrating ? "Opening" : status}
           </span>
           <span className="min-w-0 truncate font-mono" style={{ color: "var(--text-muted)" }}>
             {branchLabel}
           </span>
+          <span
+            className="hidden min-w-0 truncate font-mono md:inline"
+            style={{ color: "var(--text-muted)" }}
+          >
+            {displayCwd}
+          </span>
         </div>
 
         <div className="flex shrink-0 items-center gap-1">
+          <TerminalPlacementButton
+            placement={placement}
+            onPlacementChange={onPlacementChange}
+          />
           <TerminalIconButton
             label="Clear terminal"
             onClick={() => void handleClear()}
-            disabled={isClearing}
+            disabled={isClearing || isHydrating}
           >
             <Trash2 className="h-3.5 w-3.5" />
           </TerminalIconButton>
           <TerminalIconButton
-            label="Restart terminal"
+            label="Start fresh terminal session"
             onClick={() => void handleRestart()}
-            disabled={isRestarting}
+            disabled={isRestarting || isHydrating}
           >
             <RefreshCw className={cn("h-3.5 w-3.5", isRestarting && "animate-spin")} />
           </TerminalIconButton>
@@ -463,13 +654,60 @@ export function AgentTerminalDrawer({
         </div>
       </div>
 
-      <div
-        ref={containerRef}
-        className="h-[calc(100%-2.25rem)] w-full px-3 py-2"
-        aria-label={`Terminal for ${branchLabel}`}
-        title={cwd}
-      />
-    </div>
+      <div className="relative h-[calc(100%-2.25rem)] w-full">
+        {isHydrating && (
+          <div
+            className="absolute inset-0 flex items-start px-3 py-2 font-mono text-xs"
+            style={{ color: "var(--text-muted)" }}
+          >
+            Starting terminal...
+          </div>
+        )}
+        <div
+          ref={containerRef}
+          className="h-full w-full px-3 py-2"
+          aria-label={`Terminal for ${branchLabel}`}
+        />
+      </div>
+    </div>,
+    portalRoot,
+  );
+}
+
+const TERMINAL_PLACEMENT_LABELS: Record<AgentTerminalPlacement, string> = {
+  auto: "Auto",
+  chat: "Chat",
+  panel: "Panel",
+};
+
+function TerminalPlacementButton({
+  placement,
+  onPlacementChange,
+}: {
+  placement: AgentTerminalPlacement;
+  onPlacementChange: (placement: AgentTerminalPlacement) => void;
+}) {
+  const nextPlacement: AgentTerminalPlacement =
+    placement === "auto" ? "panel" : placement === "panel" ? "chat" : "auto";
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="h-7 px-2 text-[10px]"
+          onClick={() => onPlacementChange(nextPlacement)}
+          aria-label={`Terminal dock: ${TERMINAL_PLACEMENT_LABELS[placement]}`}
+          data-testid="agent-terminal-placement"
+        >
+          {TERMINAL_PLACEMENT_LABELS[placement]}
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="top" className="text-xs">
+        Move terminal docking
+      </TooltipContent>
+    </Tooltip>
   );
 }
 
