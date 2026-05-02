@@ -46,6 +46,67 @@ pub(crate) fn resolve_pkill_cli_path() -> PathBuf {
     resolve_cli_path("pkill", &["/usr/bin/pkill"])
 }
 
+pub(crate) fn agent_subprocess_env_path() -> OsString {
+    agent_subprocess_env_path_from_parts(
+        std::env::var_os("PATH").as_deref(),
+        dirs::home_dir().as_deref(),
+    )
+}
+
+pub(crate) fn agent_subprocess_env_path_from_parts(
+    existing_path: Option<&OsStr>,
+    home_dir: Option<&Path>,
+) -> OsString {
+    let mut entries = Vec::new();
+    if let Some(existing_path) = existing_path {
+        entries.extend(std::env::split_paths(existing_path));
+    }
+
+    entries.extend(
+        [
+            "/opt/homebrew/bin",
+            "/opt/homebrew/sbin",
+            "/usr/local/bin",
+            "/usr/local/sbin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin",
+        ]
+        .into_iter()
+        .map(PathBuf::from),
+    );
+
+    if let Some(home_dir) = home_dir {
+        entries.extend(
+            [
+                ".local/bin",
+                "bin",
+                ".cargo/bin",
+                ".rbenv/bin",
+                ".rbenv/shims",
+                ".asdf/bin",
+                ".asdf/shims",
+                ".pyenv/bin",
+                ".pyenv/shims",
+                ".nodenv/bin",
+                ".nodenv/shims",
+                ".volta/bin",
+            ]
+            .into_iter()
+            .map(|relative| home_dir.join(relative)),
+        );
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    entries.retain(|entry| seen.insert(entry.as_os_str().to_os_string()));
+    std::env::join_paths(entries).unwrap_or_else(|_| {
+        existing_path
+            .map(OsStr::to_os_string)
+            .unwrap_or_else(|| OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"))
+    })
+}
+
 #[cfg(windows)]
 pub(crate) fn resolve_taskkill_cli_path() -> PathBuf {
     resolve_cli_path("taskkill", &[])
@@ -238,9 +299,12 @@ fn has_safe_absolute_shape(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{prepend_resolved_node_bin_to_path, resolve_node_cli_path, safe_cli_path_from_shell_output};
+    use super::{
+        agent_subprocess_env_path_from_parts, prepend_resolved_node_bin_to_path,
+        resolve_node_cli_path, safe_cli_path_from_shell_output,
+    };
     use std::ffi::OsStr;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     struct EnvGuard {
         key: &'static str,
@@ -331,5 +395,20 @@ mod tests {
                 PathBuf::from("/bin"),
             ]
         );
+    }
+
+    #[test]
+    fn agent_subprocess_path_preserves_existing_path_and_adds_common_dev_bins() {
+        let path = agent_subprocess_env_path_from_parts(
+            Some(OsStr::new("/existing/bin:/usr/bin")),
+            Some(Path::new("/Users/example")),
+        );
+        let path = path.to_string_lossy();
+
+        assert!(path.contains("/existing/bin"));
+        assert!(path.contains("/opt/homebrew/bin"));
+        assert!(path.contains("/usr/local/bin"));
+        assert!(path.contains("/Users/example/.cargo/bin"));
+        assert!(path.contains("/Users/example/.asdf/shims"));
     }
 }

@@ -219,6 +219,10 @@ pub(crate) fn find_base_plugin_dir() -> Option<PathBuf> {
 
 /// Apply common Claude CLI environment flags for RalphX-managed spawns.
 pub fn apply_common_spawn_env(cmd: &mut Command) {
+    cmd.env(
+        "PATH",
+        crate::infrastructure::tool_paths::agent_subprocess_env_path(),
+    );
     cmd.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
     cmd.env("CLAUDE_CODE_ENABLE_TASKS", "1");
     cmd.env("DEBUG", "true");
@@ -1755,7 +1759,7 @@ mod create_mcp_config_tests;
 mod tests {
     use super::*;
     use std::ffi::OsStr;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     /// build_spawnable_command calls ensure_claude_spawn_allowed() which returns
     /// Err in tests — exercise the function up to that guard.
@@ -1830,6 +1834,23 @@ mod tests {
         let path_entries = std::env::split_paths(&path_value).collect::<Vec<_>>();
 
         assert_eq!(path_entries.first(), Some(&expected_node_bin));
+    }
+
+    #[test]
+    fn common_spawn_env_sets_agent_tool_path() {
+        let mut command = Command::new("/fake/claude");
+        apply_common_spawn_env(&mut command);
+
+        let path = command
+            .as_std()
+            .get_envs()
+            .find_map(|(key, value)| {
+                (key == "PATH").then(|| value.map(|path| path.to_string_lossy().into_owned()))?
+            })
+            .expect("PATH should be explicitly set for agent subprocesses");
+
+        assert!(path.contains("/opt/homebrew/bin"));
+        assert!(path.contains("/usr/local/bin"));
     }
 
     /// build_base_cli_command with is_external_mcp=true is also blocked in tests by the
